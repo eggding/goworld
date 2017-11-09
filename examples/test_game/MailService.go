@@ -24,6 +24,10 @@ type MailService struct {
 	mailPacker    netutil.MsgPacker
 }
 
+func (s *MailService) DefineAttrs(desc *entity.EntityTypeDesc) {
+	desc.DefineAttr("lastMailID", "Persistent")
+}
+
 // OnInit is called when initializing MailService
 func (s *MailService) OnInit() {
 	s.mailPacker = netutil.MessagePackMsgPacker{}
@@ -31,14 +35,14 @@ func (s *MailService) OnInit() {
 
 // OnCreated is called when MailService is created
 func (s *MailService) OnCreated() {
-	gwlog.Info("Registering MailService ...")
-	s.Attrs.SetDefault("lastMailID", 0)
+	gwlog.Infof("Registering MailService ...")
+	s.Attrs.SetDefaultInt("lastMailID", 0)
 	s.DeclareService("MailService")
 }
 
 // SendMail handles send mail requests from avatars
 func (s *MailService) SendMail(senderID common.EntityID, senderName string, targetID common.EntityID, data MailData) {
-	gwlog.Debug("%s.SendMail: sender=%s,%s, target=%s, mail=%v", s, senderID, senderName, targetID, data)
+	gwlog.Debugf("%s.SendMail: sender=%s,%s, target=%s, mail=%v", s, senderID, senderName, targetID, data)
 
 	mailID := s.genMailID()
 	mailKey := s.getMailKey(mailID, targetID)
@@ -60,7 +64,7 @@ func (s *MailService) SendMail(senderID common.EntityID, senderName string, targ
 			gwlog.Panicf("Put mail to kvdb failed: %s", err)
 			s.Call(senderID, "OnSendMail", false)
 		}
-		gwlog.Debug("Put mail %s to KVDB succeed", mailKey)
+		gwlog.Debugf("Put mail %s to KVDB succeed", mailKey)
 		s.Call(senderID, "OnSendMail", true)
 		// tell the target that you have got a mail
 		s.Call(targetID, "NotifyReceiveMail")
@@ -88,8 +92,8 @@ func (s *MailService) GetMails(avatarID common.EntityID, lastMailID int) {
 }
 
 func (s *MailService) genMailID() int {
-	lastMailID := s.Attrs.GetInt("lastMailID") + 1
-	s.Attrs.Set("lastMailID", lastMailID)
+	lastMailID := int(s.Attrs.GetInt("lastMailID")) + 1
+	s.Attrs.SetInt("lastMailID", int64(lastMailID))
 	return lastMailID
 }
 

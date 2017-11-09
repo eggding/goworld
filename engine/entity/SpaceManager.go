@@ -3,7 +3,7 @@ package entity
 import (
 	"reflect"
 
-	. "github.com/xiaonanln/goworld/engine/common"
+	"github.com/xiaonanln/goworld/engine/common"
 )
 
 var (
@@ -12,12 +12,12 @@ var (
 )
 
 type _SpaceManager struct {
-	spaces map[EntityID]*Space
+	spaces map[common.EntityID]*Space
 }
 
 func newSpaceManager() *_SpaceManager {
 	return &_SpaceManager{
-		spaces: map[EntityID]*Space{},
+		spaces: map[common.EntityID]*Space{},
 	}
 }
 
@@ -25,23 +25,18 @@ func (spmgr *_SpaceManager) putSpace(space *Space) {
 	spmgr.spaces[space.ID] = space
 }
 
-func (spmgr *_SpaceManager) delSpace(id EntityID) {
+func (spmgr *_SpaceManager) delSpace(id common.EntityID) {
 	delete(spmgr.spaces, id)
 }
 
-func (spmgr *_SpaceManager) getSpace(id EntityID) *Space {
+func (spmgr *_SpaceManager) getSpace(id common.EntityID) *Space {
 	return spmgr.spaces[id]
 }
 
-// RegisterSpace registers the custom space type
-func RegisterSpace(spacePtr ISpace) {
-	//if spaceType == nil {
-	//	gwlog.Panicf("RegisterSpace: Space already registered")
-	//}
+// RegisterSpace registers the user custom space type
+func RegisterSpace(spacePtr IEntity) {
 	spaceVal := reflect.Indirect(reflect.ValueOf(spacePtr))
 	spaceType = spaceVal.Type()
 
-	RegisterEntity(_SPACE_ENTITY_TYPE, spacePtr.(IEntity)).DefineAttrs(map[string][]string{
-		_SPACE_KIND_ATTR_KEY: {"AllClients"}, // set to AllClients so that entities in space can visit space kind
-	})
+	RegisterEntity(_SPACE_ENTITY_TYPE, spacePtr, false, false)
 }

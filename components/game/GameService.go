@@ -11,11 +11,13 @@ import (
 	"github.com/xiaonanln/go-xnsyncutil/xnsyncutil"
 	"github.com/xiaonanln/goTimer"
 	"github.com/xiaonanln/goworld/components/dispatcher/dispatcherclient"
+	"github.com/xiaonanln/goworld/engine/async"
 	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/config"
 	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/entity"
 	"github.com/xiaonanln/goworld/engine/gwlog"
+	"github.com/xiaonanln/goworld/engine/gwutils"
 	"github.com/xiaonanln/goworld/engine/kvdb"
 	"github.com/xiaonanln/goworld/engine/netutil"
 	"github.com/xiaonanln/goworld/engine/post"
@@ -36,7 +38,7 @@ type packetQueueItem struct { // packet queue from dispatcher client
 	packet  *netutil.Packet
 }
 
-type GameService struct {
+type _GameService struct {
 	config       *config.GameConfig
 	id           uint16
 	gameDelegate IGameDelegate
@@ -49,8 +51,8 @@ type GameService struct {
 	//collectEntitySycnInfosReply   chan interface{}
 }
 
-func newGameService(gameid uint16, delegate IGameDelegate) *GameService {
-	return &GameService{
+func newGameService(gameid uint16, delegate IGameDelegate) *_GameService {
+	return &_GameService{
 		id:           gameid,
 		gameDelegate: delegate,
 		//registeredServices: map[string]entity.EntityIDSet{},
@@ -63,7 +65,7 @@ func newGameService(gameid uint16, delegate IGameDelegate) *GameService {
 	}
 }
 
-func (gs *GameService) run(restore bool) {
+func (gs *_GameService) run(restore bool) {
 	gs.runState.Store(rsRunning)
 
 	if !restore {
@@ -76,13 +78,14 @@ func (gs *GameService) run(restore bool) {
 		}
 	}
 
-	netutil.ServeForever(gs.serveRoutine)
+	fmt.Fprintf(gwlog.GetOutput(), "%s\n", consts.GAME_STARTED_TAG)
+	gwutils.RepeatUntilPanicless(gs.serveRoutine)
 }
 
-func (gs *GameService) serveRoutine() {
+func (gs *_GameService) serveRoutine() {
 	cfg := config.GetGame(gameid)
 	gs.config = cfg
-	gwlog.Info("Read game %d config: \n%s\n", gameid, config.DumpPretty(cfg))
+	gwlog.Infof("Read game %d config: \n%s\n", gameid, config.DumpPretty(cfg))
 
 	ticker := time.Tick(consts.GAME_SERVICE_TICK_INTERVAL)
 	// here begins the main loop of Game
@@ -168,22 +171,27 @@ func (gs *GameService) serveRoutine() {
 		post.Tick()
 		if isTick {
 			gameDispatcherClientDelegate.HandleDispatcherClientBeforeFlush()
-			dispatcherclient.GetDispatcherClientForSend().Flush()
+			dispatcherclient.GetDispatcherClientForSend().Flush("GameService")
 		}
 	}
 }
 
-func (gs *GameService) waitPostsComplete() {
+func (gs *_GameService) waitPostsComplete() {
+	gwlog.Infof("waiting for posts to complete ...")
 	post.Tick() // just tick is Ok, tick will consume all posts
 }
 
-func (gs *GameService) doTerminate() {
+func (gs *_GameService) doTerminate() {
 	// wait for all posts to complete
 	gs.waitPostsComplete()
+	// wait for all async to clear
+	for async.WaitClear() { // wait for all async to stop
+		gs.waitPostsComplete()
+	}
 
 	// destroy all entities
 	entity.OnGameTerminating()
-	gwlog.Info("All entities saved & destroyed, game service terminated.")
+	gwlog.Infof("All entities saved & destroyed, game service terminated.")
 	gs.runState.Store(rsTerminated)
 
 	for {
@@ -191,46 +199,54 @@ func (gs *GameService) doTerminate() {
 	}
 }
 
-var freezePacker = netutil.JSONMsgPacker{}
+var freezePacker = netutil.MessagePackMsgPacker{}
 
-func (gs *GameService) doFreeze() {
+func (gs *_GameService) doFreeze() {
 	// wait for all posts to complete
-
-	kvdb.Close()
-	kvdb.WaitTerminated()
+	st := time.Now()
 	gs.waitPostsComplete()
 
-	// save all entities
-	entity.SaveAllEntities()
+	// wait for all async to clear
+	for async.WaitClear() { // wait for all async to stop
+		gs.waitPostsComplete()
+	}
+	gwlog.Infof("wait async & posts clear takes %s", time.Now().Sub(st))
+
 	// destroy all entities
 	freeze := func() error {
+		st = time.Now()
 		freezeEntity, err := entity.Freeze(gameid)
 		if err != nil {
 			return err
 		}
+		gwlog.Infof("freeze entities takes %s", time.Now().Sub(st))
+		st = time.Now()
 		freezeData, err := freezePacker.PackMsg(freezeEntity, nil)
 		if err != nil {
 			return err
 		}
+		gwlog.Infof("pack entities takes %s, total data size: %d", time.Now().Sub(st), len(freezeData))
+		st = time.Now()
 		freezeFilename := freezeFilename(gameid)
 		err = ioutil.WriteFile(freezeFilename, freezeData, 0644)
 		if err != nil {
 			return err
 		}
+		gwlog.Infof("write freeze data to file takes %s", time.Now().Sub(st))
 
 		return nil
 	}
 
 	err := freeze()
 	if err != nil {
-		gwlog.Error("Game freeze failed: %s", err)
+		gwlog.Errorf("Game freeze failed: %s, server has to quit", err)
 		kvdb.Initialize() // restore kvdb module
 		gs.runState.Store(rsRunning)
 		return
 	}
 
 	gs.runState.Store(rsFreezed)
-	gwlog.Info("All entities saved & freezed, game service terminated.")
+	gwlog.Infof("All entities saved & freezed, game service terminated.")
 	for {
 		time.Sleep(time.Second)
 	}
@@ -240,70 +256,77 @@ func freezeFilename(gameid uint16) string {
 	return fmt.Sprintf("game%d_freezed.dat", gameid)
 }
 
-func (gs *GameService) doRestore() error {
+func (gs *_GameService) doRestore() error {
+	t0 := time.Now()
 	freezeFilename := freezeFilename(gameid)
 	data, err := ioutil.ReadFile(freezeFilename)
 	if err != nil {
 		return err
 	}
 
+	t1 := time.Now()
 	var freezeEntity entity.FreezeData
 	freezePacker.UnpackMsg(data, &freezeEntity)
+	t2 := time.Now()
 
-	return entity.RestoreFreezedEntities(&freezeEntity)
+	err = entity.RestoreFreezedEntities(&freezeEntity)
+	t3 := time.Now()
+
+	gwlog.Infof("Restored game service: load = %s, unpack = %s, restore = %s", t1.Sub(t0), t2.Sub(t1), t3.Sub(t2))
+	return err
 }
 
-func (gs *GameService) String() string {
-	return fmt.Sprintf("GameService<%d>", gs.id)
+func (gs *_GameService) String() string {
+	return fmt.Sprintf("_GameService<%d>", gs.id)
 }
 
-func (gs *GameService) HandleCreateEntityAnywhere(typeName string, data map[string]interface{}) {
+func (gs *_GameService) HandleCreateEntityAnywhere(typeName string, data map[string]interface{}) {
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleCreateEntityAnywhere: typeName=%s, data=%v", gs, typeName, data)
+		gwlog.Debugf("%s.handleCreateEntityAnywhere: typeName=%s, data=%v", gs, typeName, data)
 	}
 	entity.CreateEntityLocally(typeName, data, nil)
 }
 
-func (gs *GameService) HandleLoadEntityAnywhere(typeName string, entityID common.EntityID) {
+func (gs *_GameService) HandleLoadEntityAnywhere(typeName string, entityID common.EntityID) {
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleLoadEntityAnywhere: typeName=%s, entityID=%s", gs, typeName, entityID)
+		gwlog.Debugf("%s.handleLoadEntityAnywhere: typeName=%s, entityID=%s", gs, typeName, entityID)
 	}
 	entity.LoadEntityLocally(typeName, entityID)
 }
 
-func (gs *GameService) HandleDeclareService(entityID common.EntityID, serviceName string) {
+func (gs *_GameService) HandleDeclareService(entityID common.EntityID, serviceName string) {
 	// tell the entity that it is registered successfully
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleDeclareService: %s declares %s", gs, entityID, serviceName)
+		gwlog.Debugf("%s.handleDeclareService: %s declares %s", gs, entityID, serviceName)
 	}
 	entity.OnDeclareService(serviceName, entityID)
 }
 
-func (gs *GameService) HandleUndeclareService(entityID common.EntityID, serviceName string) {
+func (gs *_GameService) HandleUndeclareService(entityID common.EntityID, serviceName string) {
 	// tell the entity that it is registered successfully
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.HandleUndeclareService: %s undeclares %s", gs, entityID, serviceName)
+		gwlog.Debugf("%s.HandleUndeclareService: %s undeclares %s", gs, entityID, serviceName)
 	}
 	entity.OnUndeclareService(serviceName, entityID)
 }
 
-func (gs *GameService) HandleNotifyAllGamesConnected() {
+func (gs *_GameService) HandleNotifyAllGamesConnected() {
 	// all games are connected
-	gwlog.Info("All games connected.")
+	gwlog.Infof("All games connected.")
 	gs.gameDelegate.OnGameReady()
 }
 
-func (gs *GameService) HandleGateDisconnected(gateid uint16) {
+func (gs *_GameService) HandleGateDisconnected(gateid uint16) {
 	entity.OnGateDisconnected(gateid)
 }
 
-func (gs *GameService) HandleStartFreezeGameAck() {
-	gwlog.Info("Start freeze game ACK received, start freezing ...")
+func (gs *_GameService) HandleStartFreezeGameAck() {
+	gwlog.Infof("Start freeze game ACK received, start freezing ...")
 	gs.runState.Store(rsFreezing)
 }
 
-func (gs *GameService) HandleSyncPositionYawFromClient(pkt *netutil.Packet) {
-	//gwlog.Info("handleSyncPositionYawFromClient: payload %d", len(pkt.UnreadPayload()))
+func (gs *_GameService) HandleSyncPositionYawFromClient(pkt *netutil.Packet) {
+	//gwlog.Infof("handleSyncPositionYawFromClient: payload %d", len(pkt.UnreadPayload()))
 	payload := pkt.UnreadPayload()
 	payloadLen := len(payload)
 	for i := 0; i < payloadLen; i += proto.SYNC_INFO_SIZE_PER_ENTITY + common.ENTITYID_LENGTH {
@@ -316,44 +339,44 @@ func (gs *GameService) HandleSyncPositionYawFromClient(pkt *netutil.Packet) {
 	}
 }
 
-func (gs *GameService) HandleCallEntityMethod(entityID common.EntityID, method string, args [][]byte, clientid common.ClientID) {
+func (gs *_GameService) HandleCallEntityMethod(entityID common.EntityID, method string, args [][]byte, clientid common.ClientID) {
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleCallEntityMethod: %s.%s(%v)", gs, entityID, method, args)
+		gwlog.Debugf("%s.handleCallEntityMethod: %s.%s(%v)", gs, entityID, method, args)
 	}
 	entity.OnCall(entityID, method, args, clientid)
 }
 
-func (gs *GameService) HandleNotifyClientConnected(clientid common.ClientID, gid uint16) {
+func (gs *_GameService) HandleNotifyClientConnected(clientid common.ClientID, gid uint16) {
 	client := entity.MakeGameClient(clientid, gid)
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleNotifyClientConnected: %s", gs, client)
+		gwlog.Debugf("%s.handleNotifyClientConnected: %s", gs, client)
 	}
 
 	// create a boot entity for the new client and set the client as the OWN CLIENT of the entity
 	entity.CreateEntityLocally(gs.config.BootEntity, nil, client)
 }
 
-func (gs *GameService) HandleNotifyClientDisconnected(clientid common.ClientID) {
+func (gs *_GameService) HandleNotifyClientDisconnected(clientid common.ClientID) {
 	if consts.DEBUG_CLIENTS {
-		gwlog.Debug("%s.handleNotifyClientDisconnected: %s", gs, clientid)
+		gwlog.Debugf("%s.handleNotifyClientDisconnected: %s", gs, clientid)
 	}
 	// find the owner of the client, and notify lose client
 	entity.OnClientDisconnected(clientid)
 }
 
-func (gs *GameService) HandleMigrateRequestAck(pkt *netutil.Packet) {
+func (gs *_GameService) HandleMigrateRequestAck(pkt *netutil.Packet) {
 	eid := pkt.ReadEntityID()
 	spaceid := pkt.ReadEntityID()
 	spaceLoc := pkt.ReadUint16()
 
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("Entity %s is migrating to space %s at game %d", eid, spaceid, spaceLoc)
+		gwlog.Debugf("Entity %s is migrating to space %s at game %d", eid, spaceid, spaceLoc)
 	}
 
 	entity.OnMigrateRequestAck(eid, spaceid, spaceLoc)
 }
 
-func (gs *GameService) HandleRealMigrate(pkt *netutil.Packet) {
+func (gs *_GameService) HandleRealMigrate(pkt *netutil.Packet) {
 	eid := pkt.ReadEntityID()
 	_ = pkt.ReadUint16() // targetGame is not userful
 
@@ -374,16 +397,16 @@ func (gs *GameService) HandleRealMigrate(pkt *netutil.Packet) {
 	pkt.ReadData(&migrateData)
 	timerData := pkt.ReadVarBytes()
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.handleRealMigrate: entity %s migrating to space %s, typeName=%s, migrateData=%v, timerData=%v, client=%s@%d", gs, eid, spaceID, typeName, migrateData, timerData, clientid, clientsrv)
+		gwlog.Debugf("%s.handleRealMigrate: entity %s migrating to space %s, typeName=%s, migrateData=%v, timerData=%v, client=%s@%d", gs, eid, spaceID, typeName, migrateData, timerData, clientid, clientsrv)
 	}
 
 	entity.OnRealMigrate(eid, spaceID, x, y, z, typeName, migrateData, timerData, clientid, clientsrv)
 }
 
-func (gs *GameService) terminate() {
+func (gs *_GameService) terminate() {
 	gs.runState.Store(rsTerminating)
 }
 
-func (gs *GameService) freeze() {
+func (gs *_GameService) freeze() {
 	dispatcherclient.GetDispatcherClientForSend().SendStartFreezeGame(gameid)
 }

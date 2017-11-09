@@ -11,7 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/xiaonanln/goworld/components/dispatcher/dispatcherclient"
-	. "github.com/xiaonanln/goworld/engine/common"
+	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 	"github.com/xiaonanln/goworld/engine/gwutils"
@@ -27,14 +27,18 @@ var (
 
 // EntityTypeDesc is the entity type description for registering entity types
 type EntityTypeDesc struct {
-	entityType      reflect.Type
-	rpcDescs        rpcDescMap
-	allClientAttrs  StringSet
-	clientAttrs     StringSet
-	persistentAttrs StringSet
+	isPersistent                      bool
+	useAOI                            bool
+	entityType                        reflect.Type
+	rpcDescs                          rpcDescMap
+	allClientAttrs                    common.StringSet
+	clientAttrs                       common.StringSet
+	persistentAttrs                   common.StringSet
+	compositiveMethodComponentIndices map[string][]int
+	//definedAttrs                      bool
 }
 
-var _VALID_ATTR_DEFS = StringSet{} // all valid attribute defs
+var _VALID_ATTR_DEFS = common.StringSet{} // all valid attribute defs
 
 func init() {
 	_VALID_ATTR_DEFS.Add(strings.ToLower("Client"))
@@ -42,54 +46,53 @@ func init() {
 	_VALID_ATTR_DEFS.Add(strings.ToLower("Persistent"))
 }
 
-// DefineAttrs defines properties of entity attributes
-//
-// Valid attribute properties includes Client, AllClient, Persistent
-func (desc *EntityTypeDesc) DefineAttrs(attrDefs map[string][]string) {
+func (desc *EntityTypeDesc) DefineAttr(attr string, defs ...string) {
+	gwlog.Infof("        Attr %s = %v", attr, defs)
+	isAllClient, isClient, isPersistent := false, false, false
 
-	for attr, defs := range attrDefs {
-		isAllClient, isClient, isPersistent := false, false, false
+	for _, def := range defs {
+		def := strings.ToLower(def)
 
-		for _, def := range defs {
-			def := strings.ToLower(def)
+		if !_VALID_ATTR_DEFS.Contains(def) {
+			// not a valid def
+			gwlog.Panicf("attribute %s: invalid property: %s; all valid properties: %v", attr, def, _VALID_ATTR_DEFS.ToList())
+		}
 
-			if !_VALID_ATTR_DEFS.Contains(def) {
-				// not a valid def
-				gwlog.Panicf("attribute %s: invalid property: %s; all valid properties: %v", attr, def, _VALID_ATTR_DEFS.ToList())
+		if def == "allclients" {
+			isAllClient = true
+			isClient = true
+		} else if def == "client" {
+			isClient = true
+		} else if def == "persistent" {
+			isPersistent = true
+			// make sure non-persistent entity has no persistent attributes
+			if !desc.isPersistent {
+				gwlog.Fatalf("Entity type %s is not persistent, should not define persistent attribute: %s", desc.entityType.Name(), attr)
 			}
+		}
+	}
 
-			if def == "allclients" {
-				isAllClient = true
-				isClient = true
-			} else if def == "client" {
-				isClient = true
-			} else if def == "persistent" {
-				isPersistent = true
-			}
-		}
-
-		if isAllClient {
-			desc.allClientAttrs.Add(attr)
-		}
-		if isClient {
-			desc.clientAttrs.Add(attr)
-		}
-		if isPersistent {
-			desc.persistentAttrs.Add(attr)
-		}
+	if isAllClient {
+		desc.allClientAttrs.Add(attr)
+	}
+	if isClient {
+		desc.clientAttrs.Add(attr)
+	}
+	if isPersistent {
+		desc.persistentAttrs.Add(attr)
 	}
 }
 
 type _EntityManager struct {
 	entities           EntityMap
-	ownerOfClient      map[ClientID]EntityID
+	ownerOfClient      map[common.ClientID]common.EntityID
 	registeredServices map[string]EntityIDSet
 }
 
 func newEntityManager() *_EntityManager {
 	return &_EntityManager{
 		entities:           EntityMap{},
-		ownerOfClient:      map[ClientID]EntityID{},
+		ownerOfClient:      map[common.ClientID]common.EntityID{},
 		registeredServices: map[string]EntityIDSet{},
 	}
 }
@@ -98,23 +101,23 @@ func (em *_EntityManager) put(entity *Entity) {
 	em.entities.Add(entity)
 }
 
-func (em *_EntityManager) del(entityID EntityID) {
+func (em *_EntityManager) del(entityID common.EntityID) {
 	em.entities.Del(entityID)
 }
 
-func (em *_EntityManager) get(id EntityID) *Entity {
+func (em *_EntityManager) get(id common.EntityID) *Entity {
 	return em.entities.Get(id)
 }
 
-func (em *_EntityManager) onEntityLoseClient(clientid ClientID) {
+func (em *_EntityManager) onEntityLoseClient(clientid common.ClientID) {
 	delete(em.ownerOfClient, clientid)
 }
 
-func (em *_EntityManager) onEntityGetClient(entityID EntityID, clientid ClientID) {
+func (em *_EntityManager) onEntityGetClient(entityID common.EntityID, clientid common.ClientID) {
 	em.ownerOfClient[clientid] = entityID
 }
 
-func (em *_EntityManager) onClientDisconnected(clientid ClientID) {
+func (em *_EntityManager) onClientDisconnected(clientid common.ClientID) {
 	eid := em.ownerOfClient[clientid]
 	if !eid.IsNil() { // should always true
 		em.onEntityLoseClient(clientid)
@@ -133,7 +136,7 @@ func (em *_EntityManager) onGateDisconnected(gateid uint16) {
 	}
 }
 
-func (em *_EntityManager) onDeclareService(serviceName string, eid EntityID) {
+func (em *_EntityManager) onDeclareService(serviceName string, eid common.EntityID) {
 	eids, ok := em.registeredServices[serviceName]
 	if !ok {
 		eids = EntityIDSet{}
@@ -142,14 +145,14 @@ func (em *_EntityManager) onDeclareService(serviceName string, eid EntityID) {
 	eids.Add(eid)
 }
 
-func (em *_EntityManager) onUndeclareService(serviceName string, eid EntityID) {
+func (em *_EntityManager) onUndeclareService(serviceName string, eid common.EntityID) {
 	eids, ok := em.registeredServices[serviceName]
 	if ok {
 		eids.Del(eid)
 	}
 }
 
-func (em *_EntityManager) chooseServiceProvider(serviceName string) EntityID {
+func (em *_EntityManager) chooseServiceProvider(serviceName string) common.EntityID {
 	// choose one entity ID of service providers randomly
 	eids, ok := em.registeredServices[serviceName]
 	if !ok {
@@ -166,21 +169,30 @@ func (em *_EntityManager) chooseServiceProvider(serviceName string) EntityID {
 	return "" // never goes here
 }
 
-func RegisterEntity(typeName string, entityPtr IEntity) *EntityTypeDesc {
+// RegisterEntity registers custom entity type and define entity behaviors
+func RegisterEntity(typeName string, entity IEntity, isPersistent bool, useAOI bool) {
 	if _, ok := registeredEntityTypes[typeName]; ok {
 		gwlog.Panicf("RegisterEntity: Entity type %s already registered", typeName)
 	}
-	entityVal := reflect.Indirect(reflect.ValueOf(entityPtr))
+
+	entityVal := reflect.ValueOf(entity)
 	entityType := entityVal.Type()
+
+	if entityType.Kind() == reflect.Ptr {
+		entityType = entityType.Elem()
+	}
 
 	// register the string of e
 	rpcDescs := rpcDescMap{}
 	entityTypeDesc := &EntityTypeDesc{
-		entityType:      entityType,
-		rpcDescs:        rpcDescs,
-		clientAttrs:     StringSet{},
-		allClientAttrs:  StringSet{},
-		persistentAttrs: StringSet{},
+		isPersistent:                      isPersistent,
+		useAOI:                            useAOI,
+		entityType:                        entityType,
+		rpcDescs:                          rpcDescs,
+		clientAttrs:                       common.StringSet{},
+		allClientAttrs:                    common.StringSet{},
+		persistentAttrs:                   common.StringSet{},
+		compositiveMethodComponentIndices: map[string][]int{},
 	}
 	registeredEntityTypes[typeName] = entityTypeDesc
 
@@ -191,8 +203,38 @@ func RegisterEntity(typeName string, entityPtr IEntity) *EntityTypeDesc {
 		rpcDescs.visit(method)
 	}
 
-	gwlog.Debug(">>> RegisterEntity %s => %s <<<", typeName, entityType.Name())
-	return entityTypeDesc
+	gwlog.Debugf(">>> RegisterEntity %s => %s <<<", typeName, entityType.Name())
+	//// define entity attrs
+	var e *Entity = reflect.Indirect(entityVal).FieldByName("Entity").Addr().Interface().(*Entity)
+	e.V = entityVal // set necessary values for callCompositiveMethod not to panic
+	e.typeDesc = entityTypeDesc
+	e.callCompositiveMethod("DefineAttrs", entityTypeDesc)
+}
+
+var entityType = reflect.TypeOf(Entity{})
+
+func isEntityType(t reflect.Type) bool {
+	if t == entityType {
+		return true
+	}
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	entityField, ok := t.FieldByName("Entity")
+	return ok && entityField.Type == entityType
+}
+
+var componentType = reflect.TypeOf(Component{})
+
+func isComponentType(t reflect.Type) bool {
+	//if t == componentType {
+	//	return true
+	//}
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	componentField, ok := t.FieldByName("Component")
+	return ok && componentField.Type == componentType
 }
 
 type createCause int
@@ -203,8 +245,8 @@ const (
 	ccRestore
 )
 
-func createEntity(typeName string, space *Space, pos Position, entityID EntityID, data map[string]interface{}, timerData []byte, client *GameClient, cause createCause) EntityID {
-	//gwlog.Debug("createEntity: %s in Space %s", typeName, space)
+func createEntity(typeName string, space *Space, pos Vector3, entityID common.EntityID, data map[string]interface{}, timerData []byte, client *GameClient, cause createCause) common.EntityID {
+	//gwlog.Debugf("createEntity: %s in Space %s", typeName, space)
 	entityTypeDesc, ok := registeredEntityTypes[typeName]
 	if !ok {
 		gwlog.Panicf("unknown entity type: %s", typeName)
@@ -214,7 +256,7 @@ func createEntity(typeName string, space *Space, pos Position, entityID EntityID
 	}
 
 	if entityID == "" {
-		entityID = GenEntityID()
+		entityID = common.GenEntityID()
 	}
 
 	var entity *Entity
@@ -228,9 +270,9 @@ func createEntity(typeName string, space *Space, pos Position, entityID EntityID
 	entityManager.put(entity)
 	if data != nil {
 		if cause == ccCreate {
-			entity.I.LoadPersistentData(data)
+			entity.loadPersistentData(data)
 		} else {
-			entity.I.LoadMigrateData(data)
+			entity.LoadMigrateData(data)
 		}
 	} else {
 		entity.Save() // save immediately after creation
@@ -240,7 +282,7 @@ func createEntity(typeName string, space *Space, pos Position, entityID EntityID
 		entity.restoreTimers(timerData)
 	}
 
-	isPersistent := entity.I.IsPersistent()
+	isPersistent := entity.IsPersistent()
 	if isPersistent { // startup the periodical timer for saving e
 		entity.setupSaveTimer()
 	}
@@ -259,14 +301,16 @@ func createEntity(typeName string, space *Space, pos Position, entityID EntityID
 		}
 	}
 
-	gwlog.Debug("Entity %s created, cause=%d, client=%s", entity, cause, client)
+	gwlog.Debugf("Entity %s created, cause=%d, client=%s", entity, cause, client)
+	entity.callCompositiveMethod("OnAttrsReady")
+
 	if cause == ccCreate {
-		gwutils.RunPanicless(entity.I.OnCreated)
+		entity.callCompositiveMethod("OnCreated")
 	} else if cause == ccMigrate {
-		gwutils.RunPanicless(entity.I.OnMigrateIn)
+		entity.callCompositiveMethod("OnMigrateIn")
 	} else if cause == ccRestore {
 		// restore should be silent
-		gwutils.RunPanicless(entity.I.OnRestored)
+		entity.callCompositiveMethod("OnRestored")
 	}
 
 	if space != nil {
@@ -276,7 +320,7 @@ func createEntity(typeName string, space *Space, pos Position, entityID EntityID
 	return entityID
 }
 
-func loadEntityLocally(typeName string, entityID EntityID, space *Space, pos Position) {
+func loadEntityLocally(typeName string, entityID common.EntityID, space *Space, pos Vector3) {
 	// load the data from storage
 	storage.Load(typeName, entityID, func(data interface{}, err error) {
 		// callback runs in main routine
@@ -295,7 +339,7 @@ func loadEntityLocally(typeName string, entityID EntityID, space *Space, pos Pos
 	})
 }
 
-func loadEntityAnywhere(typeName string, entityID EntityID) {
+func loadEntityAnywhere(typeName string, entityID common.EntityID) {
 	dispatcherclient.GetDispatcherClientForSend().SendLoadEntityAnywhere(typeName, entityID)
 }
 
@@ -304,8 +348,8 @@ func createEntityAnywhere(typeName string, data map[string]interface{}) {
 }
 
 // CreateEntityLocally creates new entity in the local game
-func CreateEntityLocally(typeName string, data map[string]interface{}, client *GameClient) EntityID {
-	return createEntity(typeName, nil, Position{}, "", data, nil, client, ccCreate)
+func CreateEntityLocally(typeName string, data map[string]interface{}, client *GameClient) common.EntityID {
+	return createEntity(typeName, nil, Vector3{}, "", data, nil, client, ccCreate)
 }
 
 // CreateEntityAnywhere creates new entity in any game
@@ -316,29 +360,29 @@ func CreateEntityAnywhere(typeName string) {
 // LoadEntityLocally loads entity in the local game.
 //
 // LoadEntityLocally has no effect if entity already exists on any game
-func LoadEntityLocally(typeName string, entityID EntityID) {
-	loadEntityLocally(typeName, entityID, nil, Position{})
+func LoadEntityLocally(typeName string, entityID common.EntityID) {
+	loadEntityLocally(typeName, entityID, nil, Vector3{})
 }
 
 // LoadEntityAnywhere loads entity in the any game
 //
 // LoadEntityAnywhere has no effect if entity already exists on any game
-func LoadEntityAnywhere(typeName string, entityID EntityID) {
+func LoadEntityAnywhere(typeName string, entityID common.EntityID) {
 	loadEntityAnywhere(typeName, entityID)
 }
 
 // OnClientDisconnected is called by engine when client is disconnected
-func OnClientDisconnected(clientid ClientID) {
+func OnClientDisconnected(clientid common.ClientID) {
 	entityManager.onClientDisconnected(clientid) // pop the owner eid
 }
 
 // OnDeclareService is called by engine when service is declared
-func OnDeclareService(serviceName string, entityid EntityID) {
+func OnDeclareService(serviceName string, entityid common.EntityID) {
 	entityManager.onDeclareService(serviceName, entityid)
 }
 
 // OnUndeclareService is called by engine when service is undeclared
-func OnUndeclareService(serviceName string, entityid EntityID) {
+func OnUndeclareService(serviceName string, entityid common.EntityID) {
 	entityManager.onUndeclareService(serviceName, entityid)
 }
 
@@ -347,7 +391,7 @@ func GetServiceProviders(serviceName string) EntityIDSet {
 	return entityManager.registeredServices[serviceName]
 }
 
-func callEntity(id EntityID, method string, args []interface{}) {
+func callEntity(id common.EntityID, method string, args []interface{}) {
 	if consts.OPTIMIZE_LOCAL_ENTITIES {
 		e := entityManager.get(id)
 		if e != nil { // this entity is local, just call entity directly
@@ -362,16 +406,22 @@ func callEntity(id EntityID, method string, args []interface{}) {
 	}
 }
 
-func callRemote(id EntityID, method string, args []interface{}) {
+func callRemote(id common.EntityID, method string, args []interface{}) {
 	dispatcherclient.GetDispatcherClientForSend().SendCallEntityMethod(id, method, args)
 }
 
+var lastWarnedOnCallMethod = ""
+
 // OnCall is called by engine when method call reaches in the game
-func OnCall(id EntityID, method string, args [][]byte, clientID ClientID) {
+func OnCall(id common.EntityID, method string, args [][]byte, clientID common.ClientID) {
 	e := entityManager.get(id)
 	if e == nil {
 		// entity not found, may destroyed before call
-		gwlog.Error("Entity %s is not found while calling %s%v", id, method, args)
+		if method != lastWarnedOnCallMethod {
+			gwlog.Warnf("OnCall: entity %s is not found while calling %s", id, method)
+			lastWarnedOnCallMethod = method
+		}
+
 		return
 	}
 
@@ -379,11 +429,11 @@ func OnCall(id EntityID, method string, args [][]byte, clientID ClientID) {
 }
 
 // OnSyncPositionYawFromClient is called by engine to sync entity infos from client
-func OnSyncPositionYawFromClient(eid EntityID, x, y, z Coord, yaw Yaw) {
+func OnSyncPositionYawFromClient(eid common.EntityID, x, y, z Coord, yaw Yaw) {
 	e := entityManager.get(eid)
 	if e == nil {
 		// entity not found, may destroyed before call
-		gwlog.Error("OnSyncPositionYawFromClient: entity %s is not found", eid)
+		//gwlog.Errorf("OnSyncPositionYawFromClient: entity %s is not found", eid)
 		return
 	}
 
@@ -391,7 +441,7 @@ func OnSyncPositionYawFromClient(eid EntityID, x, y, z Coord, yaw Yaw) {
 }
 
 // GetEntity returns the entity with specified ID
-func GetEntity(id EntityID) *Entity {
+func GetEntity(id common.EntityID) *Entity {
 	return entityManager.get(id)
 }
 
@@ -404,7 +454,7 @@ func OnGameTerminating() {
 
 // OnGateDisconnected is called when gate is down
 func OnGateDisconnected(gateid uint16) {
-	gwlog.Warn("Gate %d disconnected", gateid)
+	gwlog.Warnf("Gate %d disconnected", gateid)
 	entityManager.onGateDisconnected(gateid)
 }
 
@@ -419,17 +469,26 @@ func SaveAllEntities() {
 
 // FreezeData is the data structure for storing entity freeze data
 type FreezeData struct {
-	Entities map[EntityID]*entityFreezeData
-	Services map[string][]EntityID
+	Entities map[common.EntityID]*entityFreezeData
+	Services map[string][]common.EntityID
 }
 
 // Freeze freezes the entity system and returns all freeze data
 func Freeze(gameid uint16) (*FreezeData, error) {
 	freeze := FreezeData{}
 
-	entityFreezeInfos := map[EntityID]*entityFreezeData{}
+	entityFreezeInfos := map[common.EntityID]*entityFreezeData{}
 	foundNilSpace := false
 	for _, e := range entityManager.entities {
+
+		err := gwutils.CatchPanic(func() {
+			e.callCompositiveMethod("OnFreeze")
+		})
+		if err != nil {
+			// OnFreeze failed
+			return nil, errors.Errorf("OnFreeze paniced: %v", err)
+		}
+
 		entityFreezeInfos[e.ID] = e.GetFreezeData()
 		if e.IsSpaceEntity() {
 			if e.ToSpace().IsNil() {
@@ -446,7 +505,7 @@ func Freeze(gameid uint16) (*FreezeData, error) {
 	}
 
 	freeze.Entities = entityFreezeInfos
-	registeredServices := make(map[string][]EntityID, len(entityManager.registeredServices))
+	registeredServices := make(map[string][]common.EntityID, len(entityManager.registeredServices))
 	for serviceName, eids := range entityManager.registeredServices {
 		registeredServices[serviceName] = eids.ToList()
 	}
@@ -485,7 +544,7 @@ func RestoreFreezedEntities(freeze *FreezeData) (err error) {
 					client = MakeGameClient(info.Client.ClientID, info.Client.GateID)
 				}
 				createEntity(typeName, space, info.Pos, eid, info.Attrs, info.TimerData, client, ccRestore)
-				gwlog.Info("Restored %s<%s> in space %s", typeName, eid, space)
+				gwlog.Debugf("Restored %s<%s> in space %s", typeName, eid, space)
 
 				if info.ESR != nil { // entity was entering space before freeze, so restore entering space
 					post.Post(func() {

@@ -17,10 +17,12 @@ import (
 
 	"os"
 
+	"path"
+
+	"github.com/go-ini/ini"
 	"github.com/pkg/errors"
 	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/gwlog"
-	"gopkg.in/ini.v1"
 )
 
 const (
@@ -52,20 +54,26 @@ type GameConfig struct {
 
 // GateConfig defines fields of gate config
 type GateConfig struct {
-	Ip                 string
-	Port               int
-	WSPort             int
-	LogFile            string
-	LogStderr          bool
-	HTTPIp             string
-	HTTPPort           int
-	LogLevel           string
-	GoMaxProcs         int
-	CompressConnection bool
+	Ip                     string
+	Port                   int
+	LogFile                string
+	LogStderr              bool
+	HTTPIp                 string
+	HTTPPort               int
+	LogLevel               string
+	GoMaxProcs             int
+	CompressConnection     bool
+	CompressFormat         string
+	EncryptConnection      bool
+	RSAKey                 string
+	RSACertificate         string
+	HeartbeatCheckInterval int
 }
 
 // DispatcherConfig defines fields of dispatcher config
 type DispatcherConfig struct {
+	BindIp    string
+	BindPort  int
 	Ip        string
 	Port      int
 	LogFile   string
@@ -88,11 +96,11 @@ type GoWorldConfig struct {
 
 // StorageConfig defines fields of storage config
 type StorageConfig struct {
-	Type      string // Type of storage
-	Directory string // Directory of filesystem storage
-	Url       string // Url of MongoDB server
-	DB        string
-	Host      string // Redis host
+	Type      string // Type of storage (filesystem, mongodb, redis, mysql)
+	Directory string // Directory of filesystem storage (filesystem)
+	Url       string // Connection URL (mongodb, redis, mysql)
+	DB        string // Database name (mongodb, redis)
+	Driver    string // SQL Driver name (mysql)
 }
 
 // KVDBConfig defines fields of KVDB config
@@ -101,13 +109,19 @@ type KVDBConfig struct {
 	Url        string // MongoDB
 	DB         string // MongoDB
 	Collection string // MongoDB
-	Host       string // Redis
+	Driver     string // SQL Driver: e.x. mysql
 
 }
 
 // SetConfigFile sets the config file path (goworld.ini by default)
 func SetConfigFile(f string) {
 	configFilePath = f
+}
+
+// GetConfigDir returns the directory of goworld.ini
+func GetConfigDir() string {
+	dir, _ := path.Split(configFilePath)
+	return dir
 }
 
 // Get returns the total GoWorld config
@@ -123,9 +137,9 @@ func Get() *GoWorldConfig {
 // Reload forces goworld server to reload the whole config
 func Reload() *GoWorldConfig {
 	configLock.Lock()
-	defer configLock.Unlock()
-
 	goWorldConfig = nil
+	configLock.Unlock()
+
 	return Get()
 }
 
@@ -142,14 +156,14 @@ func GetGate(gateid uint16) *GateConfig {
 // GetGameIDs returns all game IDs
 func GetGameIDs() []uint16 {
 	cfg := Get()
-	serverIDs := make([]int, 0, len(cfg.Games))
+	gameIDs := make([]int, 0, len(cfg.Games))
 	for id := range cfg.Games {
-		serverIDs = append(serverIDs, id)
+		gameIDs = append(gameIDs, id)
 	}
-	sort.Ints(serverIDs)
+	sort.Ints(gameIDs)
 
-	res := make([]uint16, len(serverIDs))
-	for i, id := range serverIDs {
+	res := make([]uint16, len(gameIDs))
+	for i, id := range gameIDs {
 		res[i] = uint16(id)
 	}
 	return res
@@ -200,11 +214,11 @@ func readGoWorldConfig() *GoWorldConfig {
 		Games: map[int]*GameConfig{},
 		Gates: map[int]*GateConfig{},
 	}
-	gwlog.Info("Using config file: %s", configFilePath)
+	gwlog.Infof("Using config file: %s", configFilePath)
 	iniFile, err := ini.Load(configFilePath)
 	checkConfigError(err, "")
-	serverCommonSec := iniFile.Section("server_common")
-	readGameCommonConfig(serverCommonSec, &config.GameCommon)
+	gameCommonSec := iniFile.Section("game_common")
+	readGameCommonConfig(gameCommonSec, &config.GameCommon)
 	gateCommonSec := iniFile.Section("gate_common")
 	readGateCommonConfig(gateCommonSec, &config.GateCommon)
 
@@ -214,17 +228,17 @@ func readGoWorldConfig() *GoWorldConfig {
 			continue
 		}
 
-		//gwlog.Info("Section %s", sec.Name())
+		//gwlog.Infof("Section %s", sec.Name())
 		secName = strings.ToLower(secName)
 		if secName == "dispatcher" {
 			// dispatcher config
 			readDispatcherConfig(sec, &config.Dispatcher)
-		} else if secName == "server_common" || secName == "gate_common" {
+		} else if secName == "game_common" || secName == "gate_common" {
 			// ignore common section here
-		} else if len(secName) > 6 && secName[:6] == "server" {
-			// server config
-			id, err := strconv.Atoi(secName[6:])
-			checkConfigError(err, fmt.Sprintf("invalid server name: %s", secName))
+		} else if len(secName) > 4 && secName[:4] == "game" {
+			// game config
+			id, err := strconv.Atoi(secName[4:])
+			checkConfigError(err, fmt.Sprintf("invalid game name: %s", secName))
 			config.Games[id] = readGameConfig(sec, &config.GameCommon)
 		} else if len(secName) > 4 && secName[:4] == "gate" {
 			id, err := strconv.Atoi(secName[4:])
@@ -237,7 +251,7 @@ func readGoWorldConfig() *GoWorldConfig {
 			// kvdb config
 			readKVDBConfig(sec, &config.KVDB)
 		} else {
-			gwlog.Error("unknown section: %s", secName)
+			gwlog.Errorf("unknown section: %s", secName)
 		}
 
 	}
@@ -246,7 +260,7 @@ func readGoWorldConfig() *GoWorldConfig {
 
 func readGameCommonConfig(section *ini.Section, scc *GameConfig) {
 	scc.BootEntity = "Boot"
-	scc.LogFile = "server.log"
+	scc.LogFile = "game.log"
 	scc.LogStderr = true
 	scc.LogLevel = _DEFAULT_LOG_LEVEL
 	scc.SaveInterval = _DEFAULT_SAVE_ITNERVAL
@@ -257,12 +271,12 @@ func readGameCommonConfig(section *ini.Section, scc *GameConfig) {
 	_readGameConfig(section, scc)
 }
 
-func readGameConfig(sec *ini.Section, serverCommonConfig *GameConfig) *GameConfig {
-	var sc GameConfig = *serverCommonConfig // copy from server_common
+func readGameConfig(sec *ini.Section, gameCommonConfig *GameConfig) *GameConfig {
+	var sc GameConfig = *gameCommonConfig // copy from game_common
 	_readGameConfig(sec, &sc)
 	// validate game config
 	if sc.BootEntity == "" {
-		panic("boot_entity is not set in server config")
+		panic("boot_entity is not set in game config")
 	}
 	return &sc
 }
@@ -292,21 +306,35 @@ func _readGameConfig(sec *ini.Section, sc *GameConfig) {
 	}
 }
 
-func readGateCommonConfig(section *ini.Section, scc *GateConfig) {
-	scc.LogFile = "gate.log"
-	scc.LogStderr = true
-	scc.LogLevel = _DEFAULT_LOG_LEVEL
-	scc.HTTPIp = _DEFAULT_HTTP_IP
-	scc.HTTPPort = 0 // pprof not enabled by default
-	scc.GoMaxProcs = 0
+func readGateCommonConfig(section *ini.Section, gcc *GateConfig) {
+	gcc.LogFile = "gate.log"
+	gcc.LogStderr = true
+	gcc.LogLevel = _DEFAULT_LOG_LEVEL
+	gcc.Ip = "0.0.0.0"
+	gcc.HTTPIp = _DEFAULT_HTTP_IP
+	gcc.HTTPPort = 0 // pprof not enabled by default
+	gcc.GoMaxProcs = 0
+	gcc.CompressFormat = ""
+	gcc.CompressFormat = "gwsnappy"
+	gcc.RSAKey = "rsa.key"
+	gcc.RSACertificate = "rsa.crt"
 
-	_readGateConfig(section, scc)
+	_readGateConfig(section, gcc)
 }
 
 func readGateConfig(sec *ini.Section, gateCommonConfig *GateConfig) *GateConfig {
-	var sc GateConfig = *gateCommonConfig // copy from server_common
+	var sc GateConfig = *gateCommonConfig // copy from game_common
 	_readGateConfig(sec, &sc)
-	// validate game config
+	// validate game config here
+	if sc.CompressConnection && sc.CompressFormat == "" {
+		gwlog.Fatalf("Gate %s: compress_connection is enabled, but compress format is not set", sec.Name())
+	}
+	if sc.EncryptConnection && sc.RSAKey == "" {
+		gwlog.Fatalf("Gate %s: encrypt_connection is enabled, but rsa_key is not set", sec.Name())
+	}
+	if sc.EncryptConnection && sc.RSACertificate == "" {
+		gwlog.Fatalf("Gate %s: encrypt_connection is enabled, but rsa_certificate is not set", sec.Name())
+	}
 	return &sc
 }
 
@@ -317,8 +345,6 @@ func _readGateConfig(sec *ini.Section, sc *GateConfig) {
 			sc.Ip = key.MustString(sc.Ip)
 		} else if name == "port" {
 			sc.Port = key.MustInt(sc.Port)
-		} else if name == "ws_port" {
-			sc.WSPort = key.MustInt(sc.WSPort)
 		} else if name == "log_file" {
 			sc.LogFile = key.MustString(sc.LogFile)
 		} else if name == "log_stderr" {
@@ -333,6 +359,16 @@ func _readGateConfig(sec *ini.Section, sc *GateConfig) {
 			sc.GoMaxProcs = key.MustInt(sc.GoMaxProcs)
 		} else if name == "compress_connection" {
 			sc.CompressConnection = key.MustBool(sc.CompressConnection)
+		} else if name == "compress_format" {
+			sc.CompressFormat = key.MustString(sc.CompressFormat)
+		} else if name == "encrypt_connection" {
+			sc.EncryptConnection = key.MustBool(sc.EncryptConnection)
+		} else if name == "rsa_key" {
+			sc.RSAKey = key.MustString(sc.RSAKey)
+		} else if name == "rsa_certificate" {
+			sc.RSACertificate = key.MustString(sc.RSACertificate)
+		} else if name == "heartbeat_check_interval" {
+			sc.HeartbeatCheckInterval = key.MustInt(sc.HeartbeatCheckInterval)
 		} else {
 			gwlog.Panicf("section %s has unknown key: %s", sec.Name(), key.Name())
 		}
@@ -340,8 +376,9 @@ func _readGateConfig(sec *ini.Section, sc *GateConfig) {
 }
 
 func readDispatcherConfig(sec *ini.Section, config *DispatcherConfig) {
+	config.BindIp = _DEFAULT_LOCALHOST_IP
 	config.Ip = _DEFAULT_LOCALHOST_IP
-	config.LogFile = ""
+	config.LogFile = "dispatcher.log"
 	config.LogStderr = true
 	config.LogLevel = _DEFAULT_LOG_LEVEL
 	config.HTTPIp = _DEFAULT_HTTP_IP
@@ -350,9 +387,13 @@ func readDispatcherConfig(sec *ini.Section, config *DispatcherConfig) {
 	for _, key := range sec.Keys() {
 		name := strings.ToLower(key.Name())
 		if name == "ip" {
-			config.Ip = key.MustString(_DEFAULT_LOCALHOST_IP)
+			config.Ip = key.MustString(config.Ip)
 		} else if name == "port" {
-			config.Port = key.MustInt(0)
+			config.Port = key.MustInt(config.Port)
+		} else if name == "bind_ip" {
+			config.BindIp = key.MustString(config.BindIp)
+		} else if name == "bind_port" {
+			config.BindPort = key.MustInt(config.Port)
 		} else if name == "log_file" {
 			config.LogFile = key.MustString(config.LogFile)
 		} else if name == "log_stderr" {
@@ -376,6 +417,7 @@ func readStorageConfig(sec *ini.Section, config *StorageConfig) {
 	config.Directory = "_entity_storage"
 	config.DB = _DEFAULT_STORAGE_DB
 	config.Url = ""
+	config.Driver = ""
 
 	for _, key := range sec.Keys() {
 		name := strings.ToLower(key.Name())
@@ -387,8 +429,8 @@ func readStorageConfig(sec *ini.Section, config *StorageConfig) {
 			config.Url = key.MustString(config.Url)
 		} else if name == "db" {
 			config.DB = key.MustString(config.DB)
-		} else if name == "host" {
-			config.Host = key.MustString(config.Host)
+		} else if name == "driver" {
+			config.Driver = key.MustString(config.Driver)
 		} else {
 			gwlog.Panicf("section %s has unknown key: %s", sec.Name(), key.Name())
 		}
@@ -414,8 +456,8 @@ func readKVDBConfig(sec *ini.Section, config *KVDBConfig) {
 			config.DB = key.MustString(config.DB)
 		} else if name == "collection" {
 			config.Collection = key.MustString(config.Collection)
-		} else if name == "host" {
-			config.Host = key.MustString(config.Host)
+		} else if name == "driver" {
+			config.Driver = key.MustString(config.Driver)
 		} else {
 			gwlog.Panicf("section %s has unknown key: %s", sec.Name(), key.Name())
 		}
@@ -440,13 +482,22 @@ func validateKVDBConfig(config *KVDBConfig) {
 			gwlog.Panicf("invalid %s KVDB config above", config.Type)
 		}
 	} else if config.Type == "redis" {
-		if config.Host == "" {
+		if config.Url == "" {
 			fmt.Fprintf(gwlog.GetOutput(), "%s\n", DumpPretty(config))
 			gwlog.Panicf("invalid %s KVDB config above", config.Type)
 		}
 		_, err := strconv.Atoi(config.DB) // make sure db is integer for redis
 		if err != nil {
 			gwlog.Panic(errors.Wrap(err, "redis db must be integer"))
+		}
+	} else if config.Type == "sql" {
+		if config.Driver == "" {
+			fmt.Fprintf(gwlog.GetOutput(), "%s\n", DumpPretty(config))
+			gwlog.Panicf("invalid %s KVDB config above", config.Type)
+		}
+		if config.Url == "" {
+			fmt.Fprintf(gwlog.GetOutput(), "%s\n", DumpPretty(config))
+			gwlog.Panicf("invalid %s KVDB config above", config.Type)
 		}
 	} else {
 		gwlog.Panicf("unknown storage type: %s", config.Type)
@@ -479,12 +530,20 @@ func validateStorageConfig(config *StorageConfig) {
 			gwlog.Panicf("db is not set in %s storage config", config.Type)
 		}
 	} else if config.Type == "redis" {
-		if config.Host == "" {
+		if config.Url == "" {
 			gwlog.Panicf("redis host is not set")
 		}
 		if _, err := strconv.Atoi(config.DB); err != nil {
 			gwlog.Panic(errors.Wrap(err, "redis db must be integer"))
 		}
+	} else if config.Type == "sql" {
+		if config.Driver == "" {
+			gwlog.Panicf("sql driver is not set")
+		}
+		if config.Url == "" {
+			gwlog.Panicf("db url is not set")
+		}
+
 	} else {
 		gwlog.Panicf("unknown storage type: %s", config.Type)
 		if consts.DEBUG_MODE {

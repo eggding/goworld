@@ -1,8 +1,6 @@
 package netutil
 
 import (
-	"bytes"
-	"compress/flate"
 	"encoding/binary"
 
 	"unsafe"
@@ -11,22 +9,21 @@ import (
 
 	"sync"
 
-	"io"
-
 	"fmt"
 
 	"github.com/pkg/errors"
 	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/gwlog"
+	"github.com/xiaonanln/goworld/engine/netutil/compress"
 )
 
 const (
 	_MIN_PAYLOAD_CAP = 128
 	_CAP_GROW_SHIFT  = uint(2)
 
-	_PAYLOAD_LEN_MASK    = 0x7FFFFFFF
-	_COMPRESSED_BIT_MASK = 0x80000000
+	_PAYLOAD_LEN_MASK            = 0x7FFFFFFF
+	_PAYLOAD_COMPRESSED_BIT_MASK = 0x80000000
 )
 
 var (
@@ -47,7 +44,7 @@ var (
 
 			if consts.DEBUG_PACKET_ALLOC {
 				atomic.AddInt64(&debugInfo.NewCount, 1)
-				gwlog.Info("DEBUG PACKETS: ALLOC=%d, RELEASE=%d, NEW=%d",
+				gwlog.Infof("DEBUG PACKETS: ALLOC=%d, RELEASE=%d, NEW=%d",
 					atomic.LoadInt64(&debugInfo.AllocCount),
 					atomic.LoadInt64(&debugInfo.ReleaseCount),
 					atomic.LoadInt64(&debugInfo.NewCount))
@@ -118,7 +115,7 @@ func allocPacket() *Packet {
 	return pkt
 }
 
-// NetPacket allocates a new packet
+// NewPacket allocates a new packet
 func NewPacket() *Packet {
 	return allocPacket()
 }
@@ -128,7 +125,7 @@ func (p *Packet) SetNotCompress() {
 	p.notCompress = true
 }
 
-func (p *Packet) assureCapacity(need uint32) {
+func (p *Packet) AssureCapacity(need uint32) {
 	requireCap := p.GetPayloadLen() + need
 	oldCap := p.PayloadCap()
 
@@ -164,6 +161,16 @@ func (p *Packet) Payload() []byte {
 	return p.bytes[_PREPAYLOAD_SIZE : _PREPAYLOAD_SIZE+p.GetPayloadLen()]
 }
 
+// UnwrittenPayload returns the unwritten payload, which is the left payload capacity
+func (p *Packet) UnwrittenPayload() []byte {
+	payloadLen := p.GetPayloadLen()
+	return p.bytes[_PREPAYLOAD_SIZE+payloadLen:]
+}
+
+func (p *Packet) TotalPayload() []byte {
+	return p.bytes[_PREPAYLOAD_SIZE:]
+}
+
 // UnreadPayload returns the unread payload
 func (p *Packet) UnreadPayload() []byte {
 	pos := p.readCursor + _PREPAYLOAD_SIZE
@@ -181,11 +188,6 @@ func (p *Packet) HasUnreadPayload() bool {
 func (p *Packet) data() []byte {
 	return p.bytes[0 : _PREPAYLOAD_SIZE+p.GetPayloadLen()]
 }
-
-//func (p *Packet) FreePayload() []byte {
-//	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
-//	return p.bytes[payloadEnd:]
-//}
 
 // PayloadCap returns the current payload capacity
 func (p *Packet) PayloadCap() uint32 {
@@ -223,9 +225,9 @@ func (p *Packet) ClearPayload() {
 	p.SetPayloadLen(0)
 }
 
-// AppendByte appends one byte to the end
+// AppendByte appends one byte to the end of payload
 func (p *Packet) AppendByte(b byte) {
-	p.assureCapacity(1)
+	p.AssureCapacity(1)
 	p.bytes[_PREPAYLOAD_SIZE+p.GetPayloadLen()] = b
 	*(*uint32)(unsafe.Pointer(&p.bytes[0])) += 1
 }
@@ -238,6 +240,7 @@ func (p *Packet) ReadOneByte() (v byte) {
 	return
 }
 
+// AppendBool appends one byte 1/0 to the end of payload
 func (p *Packet) AppendBool(b bool) {
 	if b {
 		p.AppendByte(1)
@@ -246,24 +249,28 @@ func (p *Packet) AppendBool(b bool) {
 	}
 }
 
+// ReadBool reads one byte 1/0 from the beginning of unread payload
 func (p *Packet) ReadBool() (v bool) {
 	return p.ReadOneByte() != 0
 }
 
+// AppendUint16 appends one uint16 to the end of payload
 func (p *Packet) AppendUint16(v uint16) {
-	p.assureCapacity(2)
+	p.AssureCapacity(2)
 	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
 	packetEndian.PutUint16(p.bytes[payloadEnd:payloadEnd+2], v)
 	*(*uint32)(unsafe.Pointer(&p.bytes[0])) += 2
 }
 
+// AppendUint32 appends one uint32 to the end of payload
 func (p *Packet) AppendUint32(v uint32) {
-	p.assureCapacity(4)
+	p.AssureCapacity(4)
 	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
 	packetEndian.PutUint32(p.bytes[payloadEnd:payloadEnd+4], v)
 	*(*uint32)(unsafe.Pointer(&p.bytes[0])) += 4
 }
 
+// PopUint32 pops one uint32 from the end of payload
 func (p *Packet) PopUint32() (v uint32) {
 	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
 	v = packetEndian.Uint32(p.bytes[payloadEnd-4 : payloadEnd])
@@ -271,59 +278,70 @@ func (p *Packet) PopUint32() (v uint32) {
 	return
 }
 
+// AppendUint64 appends one uint64 to the end of payload
 func (p *Packet) AppendUint64(v uint64) {
-	p.assureCapacity(8)
+	p.AssureCapacity(8)
 	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
 	packetEndian.PutUint64(p.bytes[payloadEnd:payloadEnd+8], v)
 	*(*uint32)(unsafe.Pointer(&p.bytes[0])) += 8
 }
 
+// PackFloat32 packs float32 in specified byte order
 func PackFloat32(order binary.ByteOrder, b []byte, f float32) {
 	fi := *(*uint32)(unsafe.Pointer(&f)) // convert bits from float32 to uint32
 	order.PutUint32(b, fi)
 }
 
+// UnpackFloat32 unpacks float32 in specified byte order
 func UnpackFloat32(order binary.ByteOrder, b []byte) (f float32) {
 	fi := order.Uint32(b)
 	f = *(*float32)(unsafe.Pointer(&fi))
 	return
 }
 
+// AppendFloat32 appends one float32 to the end of payload
 func (p *Packet) AppendFloat32(f float32) {
 	p.AppendUint32(*(*uint32)(unsafe.Pointer(&f)))
 }
 
+// ReadFloat32 reads one float32 from the beginning of unread payload
 func (p *Packet) ReadFloat32() float32 {
 	v := p.ReadUint32()
 	return *(*float32)(unsafe.Pointer(&v))
 }
 
+// AppendFloat64 appends one float64 to the end of payload
 func (p *Packet) AppendFloat64(f float64) {
 	p.AppendUint64(*(*uint64)(unsafe.Pointer(&f)))
 }
 
+// ReadFloat64 reads one float64 from the beginning of unread payload
 func (p *Packet) ReadFloat64() float64 {
 	v := p.ReadUint64()
 	return *(*float64)(unsafe.Pointer(&v))
 }
 
+// AppendBytes appends slice of bytes to the end of payload
 func (p *Packet) AppendBytes(v []byte) {
 	bytesLen := uint32(len(v))
-	p.assureCapacity(bytesLen)
+	p.AssureCapacity(bytesLen)
 	payloadEnd := _PREPAYLOAD_SIZE + p.GetPayloadLen()
 	copy(p.bytes[payloadEnd:payloadEnd+bytesLen], v)
 	*(*uint32)(unsafe.Pointer(&p.bytes[0])) += bytesLen
 }
 
+// AppendVarStr appends a varsize string to the end of payload
 func (p *Packet) AppendVarStr(s string) {
 	p.AppendVarBytes([]byte(s))
 }
 
+// AppendVarBytes appends varsize bytes to the end of payload
 func (p *Packet) AppendVarBytes(v []byte) {
 	p.AppendUint32(uint32(len(v)))
 	p.AppendBytes(v)
 }
 
+// ReadUint16 reads one uint16 from the beginning of unread payload
 func (p *Packet) ReadUint16() (v uint16) {
 	pos := p.readCursor + _PREPAYLOAD_SIZE
 	v = packetEndian.Uint16(p.bytes[pos : pos+2])
@@ -331,6 +349,7 @@ func (p *Packet) ReadUint16() (v uint16) {
 	return
 }
 
+// ReadUint32 reads one uint32 from the beginning of unread payload
 func (p *Packet) ReadUint32() (v uint32) {
 	pos := p.readCursor + _PREPAYLOAD_SIZE
 	v = packetEndian.Uint32(p.bytes[pos : pos+4])
@@ -338,6 +357,7 @@ func (p *Packet) ReadUint32() (v uint32) {
 	return
 }
 
+// ReadUint64 reads one uint64 from the beginning of unread payload
 func (p *Packet) ReadUint64() (v uint64) {
 	pos := p.readCursor + _PREPAYLOAD_SIZE
 	v = packetEndian.Uint64(p.bytes[pos : pos+8])
@@ -345,6 +365,7 @@ func (p *Packet) ReadUint64() (v uint64) {
 	return
 }
 
+// ReadBytes reads bytes from the beginning of unread payload
 func (p *Packet) ReadBytes(size uint32) []byte {
 	pos := p.readCursor + _PREPAYLOAD_SIZE
 	if pos > uint32(len(p.bytes)) || pos+size > uint32(len(p.bytes)) {
@@ -356,31 +377,45 @@ func (p *Packet) ReadBytes(size uint32) []byte {
 	return bytes
 }
 
+// AppendEntityID appends one Entity ID to the end of payload
 func (p *Packet) AppendEntityID(id common.EntityID) {
+	if len(id) != common.ENTITYID_LENGTH {
+		gwlog.Panicf("AppendEntityID: invalid entity id: %s", id)
+	}
 	p.AppendBytes([]byte(id))
 }
 
+// ReadEntityID reads one EntityID from the beginning of unread  payload
 func (p *Packet) ReadEntityID() common.EntityID {
 	return common.EntityID(p.ReadBytes(common.ENTITYID_LENGTH))
 }
+
+// AppendClientID appends one Client ID to the end of payload
 func (p *Packet) AppendClientID(id common.ClientID) {
+	if len(id) != common.CLIENTID_LENGTH {
+		gwlog.Panicf("AppendEntityID: invalid client id: %s", id)
+	}
 	p.AppendBytes([]byte(id))
 }
 
+// ReadClientID reads one ClientID from the beginning of unread  payload
 func (p *Packet) ReadClientID() common.ClientID {
 	return common.ClientID(p.ReadBytes(common.CLIENTID_LENGTH))
 }
 
+// ReadVarStr reads a varsize string from the beginning of unread  payload
 func (p *Packet) ReadVarStr() string {
 	b := p.ReadVarBytes()
 	return string(b)
 }
 
+// ReadVarBytes reads a varsize slice of bytes from the beginning of unread  payload
 func (p *Packet) ReadVarBytes() []byte {
 	blen := p.ReadUint32()
 	return p.ReadBytes(blen)
 }
 
+// AppendData appends one data of any type to the end of payload
 func (p *Packet) AppendData(msg interface{}) {
 	dataBytes, err := MSG_PACKER.PackMsg(msg, nil)
 	if err != nil {
@@ -390,16 +425,17 @@ func (p *Packet) AppendData(msg interface{}) {
 	p.AppendVarBytes(dataBytes)
 }
 
+// ReadData reads one data of any type from the beginning of unread payload
 func (p *Packet) ReadData(msg interface{}) {
 	b := p.ReadVarBytes()
-	//gwlog.Info("ReadData: %s", string(b))
+	//gwlog.Infof("ReadData: %s", string(b))
 	err := MSG_PACKER.UnpackMsg(b, msg)
 	if err != nil {
 		gwlog.Panic(err)
 	}
 }
 
-// Append arguments to packet one by one
+// AppendArgs appends arguments to the end of payload one by one
 func (p *Packet) AppendArgs(args []interface{}) {
 	argCount := uint16(len(args))
 	p.AppendUint16(argCount)
@@ -409,6 +445,7 @@ func (p *Packet) AppendArgs(args []interface{}) {
 	}
 }
 
+// ReadArgs reads a number of arguments from the beginning of unread payload
 func (p *Packet) ReadArgs() [][]byte {
 	argCount := p.ReadUint16()
 	args := make([][]byte, argCount)
@@ -419,6 +456,7 @@ func (p *Packet) ReadArgs() [][]byte {
 	return args
 }
 
+// AppendStringList appends a list of strings to the end of payload
 func (p *Packet) AppendStringList(list []string) {
 	p.AppendUint16(uint16(len(list)))
 	for _, s := range list {
@@ -426,6 +464,7 @@ func (p *Packet) AppendStringList(list []string) {
 	}
 }
 
+// ReadStringList reads a list of strings from the beginning of unread payload
 func (p *Packet) ReadStringList() []string {
 	listlen := int(p.ReadUint16())
 	list := make([]string, listlen)
@@ -435,19 +474,21 @@ func (p *Packet) ReadStringList() []string {
 	return list
 }
 
+// GetPayloadLen returns the payload length
 func (p *Packet) GetPayloadLen() uint32 {
 	return *(*uint32)(unsafe.Pointer(&p.bytes[0])) & _PAYLOAD_LEN_MASK
 }
 
+// SetPayloadLen sets the payload l
 func (p *Packet) SetPayloadLen(plen uint32) {
 	pplen := (*uint32)(unsafe.Pointer(&p.bytes[0]))
-	*pplen = (*pplen & _COMPRESSED_BIT_MASK) | plen
+	*pplen = (*pplen & _PAYLOAD_COMPRESSED_BIT_MASK) | plen
 }
 
 func (p *Packet) setPayloadLenCompressed(plen uint32, compressed bool) {
 	pplen := (*uint32)(unsafe.Pointer(&p.bytes[0]))
 	if compressed {
-		*pplen = _COMPRESSED_BIT_MASK | plen
+		*pplen = _PAYLOAD_COMPRESSED_BIT_MASK | plen
 	} else {
 		*pplen = plen
 	}
@@ -457,31 +498,25 @@ func (p *Packet) requireCompress() bool {
 	return !p.notCompress && !p.isCompressed() && p.GetPayloadLen() >= consts.PACKET_PAYLOAD_LEN_COMPRESS_THRESHOLD
 }
 
-func (p *Packet) compress(cw *flate.Writer) {
+func (p *Packet) compress(compressor compress.Compressor) {
 	if !p.requireCompress() {
 		return
 	}
 
 	payloadCap := p.PayloadCap()
 	compressedBuffer := packetBufferPools[payloadCap].Get().([]byte)
-	w := bytes.NewBuffer(compressedBuffer[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE])
-	cw.Reset(w)
+	//w := bytes.NewBuffer(compressedBuffer[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE])
+	//cw.Reset(w)
 
 	oldPayload := p.Payload()
 	oldPayloadLen := len(oldPayload)
-	if err := WriteAll(cw, oldPayload); err != nil {
-		gwlog.Panicf("compress error: %v", err)
+	compressedPayload, err := compressor.Compress(oldPayload, compressedBuffer[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE])
+	if err != nil {
+		gwlog.Panic(errors.Wrap(err, "compress failed"))
 	}
 
-	if err := cw.Flush(); err != nil {
-		gwlog.Panicf("compress error: %v", err)
-	}
-
-	compressedPayload := w.Bytes()
 	compressedPayloadLen := len(compressedPayload)
 
-	//gwlog.Info("COMPRESS %v => %v", oldPayload, compressedPayload)
-	//gwlog.Info("Old payload len %d, compressed payload len %d", oldPayloadLen, compressedPayloadLen)
 	fmt.Printf("(%.1fKB=%.1f%%)", float64(oldPayloadLen)/1024.0, float64(compressedPayloadLen)*100.0/float64(oldPayloadLen))
 
 	if compressedPayloadLen >= oldPayloadLen-4 { // leave 4 bytes for AppendUint32 in the last
@@ -496,13 +531,13 @@ func (p *Packet) compress(cw *flate.Writer) {
 	packetBufferPools[payloadCap].Put(p.bytes)
 	p.bytes = compressedBuffer
 	pplen := (*uint32)(unsafe.Pointer(&p.bytes[0]))
-	*pplen = _COMPRESSED_BIT_MASK | uint32(compressedPayloadLen)
+	*pplen = _PAYLOAD_COMPRESSED_BIT_MASK | uint32(compressedPayloadLen)
 
 	p.AppendUint32(uint32(oldPayloadLen)) // append the size of old payload to the end of packet
 	return
 }
 
-func (p *Packet) decompress(cr io.ReadCloser) {
+func (p *Packet) decompress(compressor compress.Compressor) {
 	if !p.isCompressed() {
 		return
 	}
@@ -513,19 +548,12 @@ func (p *Packet) decompress(cr io.ReadCloser) {
 	oldPayloadCap := p.PayloadCap()
 	oldPayload := p.Payload()
 	uncompressedBuffer := packetBufferPools[getPayloadCapOfPayloadLen(uncompressedPayloadLen)].Get().([]byte)
-	cr.(flate.Resetter).Reset(bytes.NewReader(oldPayload), nil)
-
-	//newPayloadLen, err := cr.Read(uncompressedBuffer[_PREPAYLOAD_SIZE:])
-	err := ReadAll(cr, uncompressedBuffer[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE+uncompressedPayloadLen])
-	if err != nil {
+	if err := compressor.Decompress(oldPayload, uncompressedBuffer[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE+uncompressedPayloadLen]); err != nil {
 		gwlog.Panic(errors.Wrap(err, "decompress failed"))
 	}
-	//if err := cr.Close(); err != nil {
-	//	gwlog.Panic(errors.Wrap(err, "close uncompressor failed"))
-	//}
 
-	//gwlog.Info("Compressed payload: %d, after decompress: %d", len(oldPayload), newPayloadLen)
-	//gwlog.Info("UNCOMPRESS: %v => %v", oldPayload, compressedPayload)
+	//gwlog.Infof("Compressed payload: %d, after decompress: %d", len(oldPayload), newPayloadLen)
+	//gwlog.Infof("UNCOMPRESS: %v => %v", oldPayload, compressedPayload)
 	if oldPayloadCap != _MIN_PAYLOAD_CAP {
 		packetBufferPools[oldPayloadCap].Put(p.bytes)
 	}
@@ -536,5 +564,5 @@ func (p *Packet) decompress(cr io.ReadCloser) {
 }
 
 func (p *Packet) isCompressed() bool {
-	return *(*uint32)(unsafe.Pointer(&p.bytes[0]))&_COMPRESSED_BIT_MASK != 0
+	return *(*uint32)(unsafe.Pointer(&p.bytes[0]))&_PAYLOAD_COMPRESSED_BIT_MASK != 0
 }

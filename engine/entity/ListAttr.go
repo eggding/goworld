@@ -1,9 +1,6 @@
 package entity
 
-import (
-	"github.com/xiaonanln/goworld/engine/gwlog"
-	"github.com/xiaonanln/typeconv"
-)
+import "github.com/xiaonanln/goworld/engine/gwlog"
 
 // ListAttr is a attribute for a list of attributes
 type ListAttr struct {
@@ -20,16 +17,51 @@ func (a *ListAttr) Size() int {
 	return len(a.items)
 }
 
-func (a *ListAttr) clearOwner() {
-	a.owner = nil
+func (a *ListAttr) clearParent() {
 	a.parent = nil
 	a.pkey = nil
-	a.path = nil
+
+	a.clearOwner()
+}
+
+func (a *ListAttr) clearOwner() {
+	a.owner = nil
 	a.flag = 0
+	a.path = nil
+
+	// clear owner of children recursively
+	for _, v := range a.items {
+		if ma, ok := v.(*MapAttr); ok {
+			ma.clearOwner()
+		} else if la, ok := v.(*ListAttr); ok {
+			la.clearOwner()
+		}
+	}
+}
+
+func (a *ListAttr) setParent(owner *Entity, parent interface{}, pkey interface{}, flag attrFlag) {
+	a.parent = parent
+	a.pkey = pkey
+
+	a.setOwner(owner, flag)
+}
+
+func (a *ListAttr) setOwner(owner *Entity, flag attrFlag) {
+	a.owner = owner
+	a.flag = flag
+
+	// set owner of children recursively
+	for _, v := range a.items {
+		if ma, ok := v.(*MapAttr); ok {
+			ma.setOwner(owner, flag)
+		} else if la, ok := v.(*ListAttr); ok {
+			la.setOwner(owner, flag)
+		}
+	}
 }
 
 // Set sets item value
-func (a *ListAttr) Set(index int, val interface{}) {
+func (a *ListAttr) set(index int, val interface{}) {
 	a.items[index] = val
 	if sa, ok := val.(*MapAttr); ok {
 		// val is ListAttr, set parent and owner accordingly
@@ -37,22 +69,14 @@ func (a *ListAttr) Set(index int, val interface{}) {
 			gwlog.Panicf("MapAttr reused in index %d", index)
 		}
 
-		sa.parent = a
-		sa.owner = a.owner
-		sa.pkey = index
-		sa.flag = a.flag
-
+		sa.setParent(a.owner, a, index, a.flag)
 		a.sendListAttrChangeToClients(index, sa.ToMap())
 	} else if sa, ok := val.(*ListAttr); ok {
 		if sa.parent != nil || sa.owner != nil || sa.pkey != nil {
 			gwlog.Panicf("MapAttr reused in index %d", index)
 		}
 
-		sa.parent = a
-		sa.owner = a.owner
-		sa.pkey = index
-		sa.flag = a.flag
-
+		sa.setParent(a.owner, a, index, a.flag)
 		a.sendListAttrChangeToClients(index, sa.ToList())
 	} else {
 		a.sendListAttrChangeToClients(index, val)
@@ -96,77 +120,116 @@ func (a *ListAttr) _getPathFromOwner() []interface{} {
 }
 
 // Get gets item value
-func (a *ListAttr) Get(index int) interface{} {
-	val := a.items[index]
-	return val
+func (a *ListAttr) get(index int) interface{} {
+	return a.items[index]
 }
 
 // GetInt gets item value as int
-func (a *ListAttr) GetInt(index int) int {
-	val := a.Get(index)
-	return int(typeconv.Int(val))
-}
-
-// GetInt64 gets item value as int64
-func (a *ListAttr) GetInt64(index int) int64 {
-	val := a.Get(index)
-	return typeconv.Int(val)
-}
-
-// GetUint64 gets item value as uint64
-func (a *ListAttr) GetUint64(index int) uint64 {
-	val := a.Get(index)
-	return uint64(typeconv.Int(val))
-}
-
-// GetStr gets item value as string
-func (a *ListAttr) GetStr(index int) string {
-	val := a.Get(index)
-	return val.(string)
+func (a *ListAttr) GetInt(index int) int64 {
+	return a.get(index).(int64)
 }
 
 // GetFloat gets item value as float64
 func (a *ListAttr) GetFloat(index int) float64 {
-	val := a.Get(index)
-	return val.(float64)
+	return a.get(index).(float64)
+}
+
+// GetStr gets item value as string
+func (a *ListAttr) GetStr(index int) string {
+	return a.get(index).(string)
 }
 
 // GetBool gets item value as bool
 func (a *ListAttr) GetBool(index int) bool {
-	val := a.Get(index)
-	return val.(bool)
+	return a.get(index).(bool)
 }
 
-// GetListAttr gets item value as List Attribute
+// GetListAttr gets item value as ListAttr
 func (a *ListAttr) GetListAttr(index int) *ListAttr {
-	val := a.Get(index)
+	val := a.get(index)
 	return val.(*ListAttr)
 }
 
+// GetMapAttr gets item value as MapAttr
+func (a *ListAttr) GetMapAttr(index int) *MapAttr {
+	val := a.get(index)
+	return val.(*MapAttr)
+}
+
+// AppendInt puts int value to the end of list
+func (a *ListAttr) AppendInt(v int64) {
+	a.append(v)
+}
+
+// AppendFloat puts float value to the end of list
+func (a *ListAttr) AppendFloat(v float64) {
+	a.append(v)
+}
+
+// AppendBool puts bool value to the end of list
+func (a *ListAttr) AppendBool(v bool) {
+	a.append(v)
+}
+
+// AppendStr puts string value to the end of list
+func (a *ListAttr) AppendStr(v string) {
+	a.append(v)
+}
+
+// AppendMapAttr puts MapAttr value to the end of list
+func (a *ListAttr) AppendMapAttr(attr *MapAttr) {
+	a.append(attr)
+}
+
+// AppendListAttr puts ListAttr value to the end of list
+func (a *ListAttr) AppendListAttr(attr *ListAttr) {
+	a.append(attr)
+}
+
 // Pop removes the last item from the end
-func (a *ListAttr) Pop() interface{} {
+func (a *ListAttr) pop() interface{} {
 	size := len(a.items)
 	val := a.items[size-1]
 	a.items = a.items[:size-1]
 
 	if sa, ok := val.(*MapAttr); ok {
-		sa.clearOwner()
+		sa.clearParent()
 	} else if sa, ok := val.(*ListAttr); ok {
-		sa.clearOwner()
+		sa.clearParent()
 	}
 
 	a.sendListAttrPopToClients()
 	return val
 }
 
-// PopListAttr removes the last item and returns as ListAttr
-func (a *ListAttr) PopListAttr() *ListAttr {
-	val := a.Pop()
-	return val.(*ListAttr)
+func (a *ListAttr) PopInt() int64 {
+	return a.pop().(int64)
 }
 
-// Append puts item to the end
-func (a *ListAttr) Append(val interface{}) {
+func (a *ListAttr) PopFloat() float64 {
+	return a.pop().(float64)
+}
+
+func (a *ListAttr) PopBool() bool {
+	return a.pop().(bool)
+}
+
+func (a *ListAttr) PopStr() string {
+	return a.pop().(string)
+}
+
+// PopListAttr removes the last item and returns as ListAttr
+func (a *ListAttr) PopListAttr() *ListAttr {
+	return a.pop().(*ListAttr)
+}
+
+// PopMapAttr removes the last item and returns as MapAttr
+func (a *ListAttr) PopMapAttr() *MapAttr {
+	return a.pop().(*MapAttr)
+}
+
+// append puts item to the end of list
+func (a *ListAttr) append(val interface{}) {
 	a.items = append(a.items, val)
 	index := len(a.items) - 1
 
@@ -187,15 +250,41 @@ func (a *ListAttr) Append(val interface{}) {
 			gwlog.Panicf("MapAttr reused in append")
 		}
 
-		sa.parent = a
-		sa.owner = a.owner
-		sa.pkey = index
-		sa.flag = a.flag
-
+		sa.setParent(a.owner, a, index, a.flag)
 		a.sendListAttrAppendToClients(sa.ToList())
 	} else {
 		a.sendListAttrAppendToClients(val)
 	}
+}
+
+// SetInt sets int value at the index
+func (a *ListAttr) SetInt(index int, v int64) {
+	a.set(index, v)
+}
+
+// SetFloat sets float value at the index
+func (a *ListAttr) SetFloat(index int, v float64) {
+	a.set(index, v)
+}
+
+// SetBool sets bool value at the index
+func (a *ListAttr) SetBool(index int, v bool) {
+	a.set(index, v)
+}
+
+// SetStr sets string value at the index
+func (a *ListAttr) SetStr(index int, v string) {
+	a.set(index, v)
+}
+
+// SetMapAttr sets MapAttr value at the index
+func (a *ListAttr) SetMapAttr(index int, attr *MapAttr) {
+	a.set(index, attr)
+}
+
+// SetListAttr sets ListAttr value at the index
+func (a *ListAttr) SetListAttr(index int, attr *ListAttr) {
+	a.set(index, attr)
 }
 
 // ToList converts ListAttr to slice, recursively
@@ -220,13 +309,13 @@ func (a *ListAttr) AssignList(l []interface{}) {
 		if iv, ok := v.(map[string]interface{}); ok {
 			ia := NewMapAttr()
 			ia.AssignMap(iv)
-			a.Append(ia)
+			a.append(ia)
 		} else if iv, ok := v.([]interface{}); ok {
 			ia := NewListAttr()
 			ia.AssignList(iv)
-			a.Append(ia)
+			a.append(ia)
 		} else {
-			a.Append(v)
+			a.append(v)
 		}
 	}
 }

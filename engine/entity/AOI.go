@@ -6,40 +6,92 @@ import (
 	"unsafe"
 )
 
+// Coord is the of coordinations entity position (x, y, z)
 type Coord float32
 
-type Position struct {
+// Vector3 is type of entity position
+type Vector3 struct {
 	X Coord
 	Y Coord
 	Z Coord
 }
 
-func (p Position) String() string {
-	return fmt.Sprintf("(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z)
+func (p Vector3) String() string {
+	return fmt.Sprintf("(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z)
 }
 
-func (p Position) DistanceTo(o Position) Coord {
+// DistanceTo calculates distance between two positions
+func (p Vector3) DistanceTo(o Vector3) Coord {
 	dx := p.X - o.X
 	dy := p.Y - o.Y
 	dz := p.Z - o.Z
 	return Coord(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
 }
 
-type AOI struct {
-	pos       Position
+// Sub calculates Vector3 p - Vector3 o
+func (p Vector3) Sub(o Vector3) Vector3 {
+	return Vector3{p.X - o.X, p.Y - o.Y, p.Z - o.Z}
+}
+
+func (p Vector3) Add(o Vector3) Vector3 {
+	return Vector3{p.X + o.X, p.Y + o.Y, p.Z + o.Z}
+}
+
+// Mul calculates Vector3 p * m
+func (p Vector3) Mul(m Coord) Vector3 {
+	return Vector3{p.X * m, p.Y * m, p.Z * m}
+}
+
+// DirToYaw convert direction represented by Vector3 to Yaw
+func (dir Vector3) DirToYaw() Yaw {
+	dir.Normalize()
+
+	yaw := math.Acos(float64(dir.X))
+	if dir.Z < 0 {
+		yaw = math.Pi*2 - yaw
+	}
+
+	yaw = yaw / math.Pi * 180 // convert to angle
+
+	if yaw <= 90 {
+		yaw = 90 - yaw
+	} else {
+		yaw = 90 + (360 - yaw)
+	}
+
+	return Yaw(yaw)
+}
+
+func (p *Vector3) Normalize() {
+	d := Coord(math.Sqrt(float64(p.X*p.X + p.Y + p.Y + p.Z*p.Z)))
+	if d == 0 {
+		return
+	}
+	p.X /= d
+	p.Y /= d
+	p.Z /= d
+}
+
+func (p Vector3) Normalized() Vector3 {
+	p.Normalize()
+	return p
+}
+
+type aoi struct {
+	pos       Vector3
 	neighbors EntitySet
-	xNext     *AOI
-	xPrev     *AOI
-	zNext     *AOI
-	zPrev     *AOI
+	xNext     *aoi
+	xPrev     *aoi
+	zNext     *aoi
+	zPrev     *aoi
 	markVal   int
 }
 
-func initAOI(aoi *AOI) {
+func initAOI(aoi *aoi) {
 	aoi.neighbors = EntitySet{}
 }
 
-// Get the owner entity of this AOI
+// Get the owner entity of this aoi
 // This is very tricky but also effective
 var aoiFieldOffset uintptr
 
@@ -47,67 +99,35 @@ func init() {
 	dummyEntity := (*Entity)(unsafe.Pointer(&aoiFieldOffset))
 	aoiFieldOffset = uintptr(unsafe.Pointer(&dummyEntity.aoi)) - uintptr(unsafe.Pointer(dummyEntity))
 }
-func (aoi *AOI) getEntity() *Entity {
+func (aoi *aoi) getEntity() *Entity {
 	return (*Entity)(unsafe.Pointer((uintptr)(unsafe.Pointer(aoi)) - aoiFieldOffset))
 }
 
-func (aoi *AOI) interest(other *Entity) {
+func (aoi *aoi) interest(other *Entity) {
 	aoi.neighbors.Add(other)
 }
 
-func (aoi *AOI) uninterest(other *Entity) {
+func (aoi *aoi) uninterest(other *Entity) {
 	aoi.neighbors.Del(other)
 }
 
-//func (sl *xAOIList) coord(aoi *AOI) Coord {
-//	if sl.xorz == 0 {
-//		return aoi.pos.X
-//	} else {
-//		return aoi.pos.Z
-//	}
-//}
+type aoiSet map[*aoi]struct{}
 
-//func (sl *xAOIList) head(aoi *AOI) *sweepListHead {
-//	if sl.xorz == 0 {
-//		return &aoi.sweepListHeadX
-//	} else {
-//		return &aoi.sweepListHeadZ
-//	}
-//}
-//
-//func (sl *xAOIList) next(aoi *AOI) *AOI {
-//	if sl.xorz == 0 {
-//		return aoi.sweepListHeadX.next
-//	} else {
-//		return aoi.sweepListHeadZ.next
-//	}
-//}
-//
-//func (sl *xAOIList) prev(aoi *AOI) *AOI {
-//	if sl.xorz == 0 {
-//		return aoi.sweepListHeadX.prev
-//	} else {
-//		return aoi.sweepListHeadZ.prev
-//	}
-//}
-
-type AOISet map[*AOI]struct{}
-
-func (aoiset AOISet) Add(aoi *AOI) {
+func (aoiset aoiSet) Add(aoi *aoi) {
 	aoiset[aoi] = struct{}{}
 }
 
-func (aoiset AOISet) Del(aoi *AOI) {
+func (aoiset aoiSet) Del(aoi *aoi) {
 	delete(aoiset, aoi)
 }
 
-func (aoiset AOISet) Contains(aoi *AOI) bool {
+func (aoiset aoiSet) Contains(aoi *aoi) bool {
 	_, ok := aoiset[aoi]
 	return ok
 }
 
-func (aoiset AOISet) Join(other AOISet) AOISet {
-	join := AOISet{}
+func (aoiset aoiSet) Join(other aoiSet) aoiSet {
+	join := aoiSet{}
 	for aoi := range aoiset {
 		if other.Contains(aoi) {
 			join.Add(aoi)

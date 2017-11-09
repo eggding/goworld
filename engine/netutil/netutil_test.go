@@ -3,11 +3,13 @@ package netutil
 import (
 	"net"
 	"testing"
+	"time"
 
 	"math/rand"
 
 	"fmt"
 
+	"github.com/xiaonanln/goworld/engine/gwioutil"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 )
 
@@ -19,36 +21,85 @@ func (ts *testEchoTcpServer) ServeTCPConnection(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			conn.Write(buf[:n])
+			gwioutil.WriteAll(conn, buf[:n])
 		}
 
 		if err != nil {
-			if IsTemporaryNetError(err) {
+			if gwioutil.IsTimeoutError(err) {
 				continue
 			} else {
-				gwlog.Error("read error: %s", err.Error())
+				gwlog.Errorf("read error: %s", err.Error())
 				break
 			}
 		}
 	}
 }
 
-func TestPacketConnection(t *testing.T) {
-	PORT := 4003
+const PORT = 14572
+
+func init() {
 	go func() {
 		ServeTCP(fmt.Sprintf("localhost:%d", PORT), &testEchoTcpServer{})
 	}()
+	time.Sleep(time.Millisecond * 200)
+}
 
-	_conn, err := net.Dial("tcp", "localhost:4002")
+//func TestCompressedConnection(t *testing.T) {
+//
+//	_conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", PORT))
+//	if err != nil {
+//		t.Errorf("connect error: %s", err)
+//	}
+//
+//	conn := NewCompressedConnection(NetConnection{_conn})
+//	s := ""
+//	for i := 0; i < 1000; i++ {
+//		s = s + "a"
+//	}
+//
+//	SR := 1
+//	for tm := 0; tm < 10; tm++ {
+//		for i := 0; i < SR; i++ {
+//			n, err := conn.Write([]byte(s))
+//			if err != nil {
+//				panic(err)
+//			}
+//			if n != len(s) {
+//				panic("write wrong size")
+//			}
+//		}
+//
+//		println("written", SR)
+//		conn.Flush()
+//
+//		recvbuf := make([]byte, len(s))
+//		for len(recvbuf) > 0 {
+//			var n int
+//			var err error
+//			if len(recvbuf) > 1000 {
+//				n, err = conn.Read(recvbuf[:1000])
+//			} else {
+//				n, err = conn.Read(recvbuf)
+//			}
+//
+//			recvbuf = recvbuf[n:]
+//			fmt.Fprintf(os.Stderr, "Read %d/%d: %v\n", len(s)*SR-len(recvbuf), len(s)*SR, err)
+//		}
+//	}
+//}
+
+func TestPacketConnection(t *testing.T) {
+
+	_conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", PORT))
 	if err != nil {
 		t.Errorf("connect error: %s", err)
 	}
 
-	conn := NewPacketConnection(NetConnection{_conn}, false)
+	conn := NewPacketConnection(NetConnection{_conn}, nil)
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 10; i++ {
 		var PAYLOAD_LEN uint32 = uint32(rand.Intn(4096 + 1))
-		gwlog.Info("Testing with payload %v", PAYLOAD_LEN)
+		gwlog.Infof("Testing with payload %v", PAYLOAD_LEN)
 
 		packet := conn.NewPacket()
 		for j := uint32(0); j < PAYLOAD_LEN; j++ {
@@ -58,6 +109,7 @@ func TestPacketConnection(t *testing.T) {
 			t.Errorf("payload should be %d, but is %d", PAYLOAD_LEN, packet.GetPayloadLen())
 		}
 		conn.SendPacket(packet)
+		conn.Flush("Test")
 		recvPacket, err := conn.RecvPacket()
 		if err != nil {
 			t.Error(err)
@@ -71,4 +123,5 @@ func TestPacketConnection(t *testing.T) {
 			}
 		}
 	}
+
 }

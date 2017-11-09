@@ -14,6 +14,8 @@ import (
 )
 
 var (
+	outputWriter io.Writer
+
 	// DebugLevel level
 	DebugLevel Level = Level(sublog.DebugLevel)
 	// InfoLevel level
@@ -27,17 +29,17 @@ var (
 	// FatalLevel level
 	FatalLevel Level = Level(sublog.FatalLevel)
 
-	// Debug logs formatted debug message
-	Debug = sublog.Debugf
-	// Info logs formatted info message
-	Info = sublog.Infof
-	// Warn logs formatted warn message
-	Warn = sublog.Warnf
-	// Error logs formatted error message
-	Error = sublog.Errorf
-
-	outputWriter io.Writer
+	// Debugf logs formatted debug message
+	Debugf logFormatFunc
+	// Infof logs formatted info message
+	Infof logFormatFunc
+	// Warnf logs formatted warn message
+	Warnf logFormatFunc
+	// Errorf logs formatted error message
+	Errorf logFormatFunc
 )
+
+type logFormatFunc func(format string, args ...interface{})
 
 // Level is type of log levels
 type Level uint8
@@ -45,13 +47,29 @@ type Level uint8
 func init() {
 	outputWriter = os.Stderr
 	sublog.SetOutput(outputWriter)
-
 	sublog.SetLevel(sublog.DebugLevel)
+	sublog.SetFormatter(&sublog.TextFormatter{FullTimestamp: true, TimestampFormat: "2006-01-02T15:04:05.000000000"})
+
+	Debugf = sublog.Debugf
+	Infof = sublog.Infof
+	Warnf = sublog.Warnf
+	Errorf = sublog.Errorf
+}
+
+// SetSource sets the component name (dispatcher/gate/game) of gwlog module
+func SetSource(comp string) {
+	logEntry := sublog.WithField("source", comp)
+
+	Debugf = logEntry.Debugf
+	Infof = logEntry.Infof
+	Warnf = logEntry.Warnf
+	Errorf = logEntry.Errorf
 }
 
 // ParseLevel parses log level string to Level
-func ParseLevel(lvl string) (sublog.Level, error) {
-	return sublog.ParseLevel(lvl)
+func ParseLevel(lvl string) (Level, error) {
+	lv, err := sublog.ParseLevel(lvl)
+	return Level(lv), err
 }
 
 // SetLevel sets the log level
@@ -62,7 +80,7 @@ func SetLevel(lv Level) {
 // TraceError prints the stack and error
 func TraceError(format string, args ...interface{}) {
 	outputWriter.Write(debug.Stack())
-	Error(format, args...)
+	Errorf(format, args...)
 }
 
 // Fatalf prints formatted fatal message
@@ -107,6 +125,6 @@ func StringToLevel(s string) Level {
 	} else if strings.ToLower(s) == "fatal" {
 		return FatalLevel
 	}
-	Error("StringToLevel: unknown level: %s", s)
+	Errorf("StringToLevel: unknown level: %s", s)
 	return DebugLevel
 }

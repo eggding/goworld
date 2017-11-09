@@ -2,7 +2,7 @@ package goworld
 
 import (
 	"github.com/xiaonanln/goworld/components/game"
-	. "github.com/xiaonanln/goworld/engine/common"
+	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/entity"
 	"github.com/xiaonanln/goworld/engine/kvdb"
 	"github.com/xiaonanln/goworld/engine/post"
@@ -21,8 +21,8 @@ func Run(delegate game.IGameDelegate) {
 //
 // returns the entity type description object which can be used to define more properties
 // of entity type
-func RegisterEntity(typeName string, entityPtr entity.IEntity) *entity.EntityTypeDesc {
-	return entity.RegisterEntity(typeName, entityPtr)
+func RegisterEntity(typeName string, entityPtr entity.IEntity, isPersistent, useAOI bool) {
+	entity.RegisterEntity(typeName, entityPtr, isPersistent, useAOI)
 }
 
 // CreateSpaceAnywhere creates a space with specified kind in any game server
@@ -33,14 +33,14 @@ func CreateSpaceAnywhere(kind int) {
 // CreateSpaceLocally creates a space with specified kind in the local game server
 //
 // returns the space EntityID
-func CreateSpaceLocally(kind int) EntityID {
+func CreateSpaceLocally(kind int) common.EntityID {
 	return entity.CreateSpaceLocally(kind)
 }
 
 // CreateEntityLocally creates a entity on the local server
 //
 // returns EntityID
-func CreateEntityLocally(typeName string) EntityID {
+func CreateEntityLocally(typeName string) common.EntityID {
 	return entity.CreateEntityLocally(typeName, nil, nil)
 }
 
@@ -50,7 +50,7 @@ func CreateEntityAnywhere(typeName string) {
 }
 
 // LoadEntityAnywhere loads the specified entity from entity storage
-func LoadEntityAnywhere(typeName string, entityID EntityID) {
+func LoadEntityAnywhere(typeName string, entityID common.EntityID) {
 	entity.LoadEntityAnywhere(typeName, entityID)
 }
 
@@ -69,12 +69,12 @@ func ListEntityIDs(typeName string, callback storage.ListCallbackFunc) {
 // Exists checks if entityID exists in entity storage
 //
 // returns result in callback
-func Exists(typeName string, entityID EntityID, callback storage.ExistsCallbackFunc) {
+func Exists(typeName string, entityID common.EntityID, callback storage.ExistsCallbackFunc) {
 	storage.Exists(typeName, entityID, callback)
 }
 
 // GetEntity gets the entity by EntityID
-func GetEntity(id EntityID) *entity.Entity {
+func GetEntity(id common.EntityID) *entity.Entity {
 	return entity.GetEntity(id)
 }
 
@@ -99,7 +99,7 @@ func ListAttr() *entity.ListAttr {
 // RegisterSpace registers the space entity type.
 //
 // All spaces will be created as an instance of this type
-func RegisterSpace(spacePtr entity.ISpace) {
+func RegisterSpace(spacePtr entity.IEntity) {
 	entity.RegisterSpace(spacePtr)
 }
 
@@ -121,4 +121,9 @@ func GetKVDB(key string, callback kvdb.KVDBGetCallback) {
 // PutKVDB puts key-value to KVDB
 func PutKVDB(key string, val string, callback kvdb.KVDBPutCallback) {
 	kvdb.Put(key, val, callback)
+}
+
+// GetOrPut gets value of key from KVDB, if val not exists or is "", put key-value to KVDB.
+func GetOrPutKVDB(key string, val string, callback kvdb.KVDBGetOrPutCallback) {
+	kvdb.GetOrPut(key, val, callback)
 }

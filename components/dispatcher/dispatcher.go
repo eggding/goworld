@@ -10,30 +10,51 @@ import (
 
 	"os/signal"
 
-	"github.com/xiaonanln/goworld/components/binutil"
+	"runtime/debug"
+
+	"github.com/xiaonanln/goworld/engine/binutil"
 	"github.com/xiaonanln/goworld/engine/config"
+	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 )
 
 var (
-	configFile = ""
-	sigChan    = make(chan os.Signal, 1)
+	configFile      = ""
+	logLevel        string
+	runInDaemonMode bool
+	sigChan         = make(chan os.Signal, 1)
 )
 
 func parseArgs() {
 	flag.StringVar(&configFile, "configfile", "", "set config file path")
+	flag.StringVar(&logLevel, "log", "", "set log level, will override log level in config")
+	flag.BoolVar(&runInDaemonMode, "d", false, "run in daemon mode")
 	flag.Parse()
+}
+
+func setupGCPercent() {
+	debug.SetGCPercent(consts.DISPATCHER_GC_PERCENT)
 }
 
 func main() {
 	parseArgs()
+	if runInDaemonMode {
+		daemoncontext := binutil.Daemonize()
+		defer daemoncontext.Release()
+	}
+
+	setupGCPercent()
 
 	if configFile != "" {
 		config.SetConfigFile(configFile)
 	}
 
 	dispatcherConfig := config.GetDispatcher()
-	binutil.SetupGWLog(dispatcherConfig.LogLevel, dispatcherConfig.LogFile, dispatcherConfig.LogStderr)
+
+	if logLevel == "" {
+		logLevel = dispatcherConfig.LogLevel
+	}
+	binutil.SetupGWLog("dispatcher", logLevel, dispatcherConfig.LogFile, dispatcherConfig.LogStderr)
 	setupSignals()
 	binutil.SetupHTTPServer(dispatcherConfig.HTTPIp, dispatcherConfig.HTTPPort, nil)
 
@@ -42,7 +63,7 @@ func main() {
 }
 
 func setupSignals() {
-	signal.Ignore(syscall.Signal(10), syscall.Signal(12))
+	signal.Ignore(syscall.Signal(10), syscall.Signal(12), syscall.SIGPIPE)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		for {
@@ -50,10 +71,10 @@ func setupSignals() {
 
 			if sig == syscall.SIGINT || sig == syscall.SIGTERM {
 				// interrupting, quit dispatcher
-				gwlog.Info("Dispatcher quited.")
+				gwlog.Infof("Dispatcher quited.")
 				os.Exit(0)
 			} else {
-				gwlog.Info("unexcepted signal: %s", sig)
+				gwlog.Infof("unexcepted signal: %s", sig)
 			}
 		}
 	}()

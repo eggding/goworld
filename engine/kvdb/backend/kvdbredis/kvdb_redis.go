@@ -6,8 +6,7 @@ import (
 	"github.com/garyburd/redigo/redis"
 	"github.com/google/btree"
 	"github.com/pkg/errors"
-	//"github.com/xiaonanln/goworld/gwlog"
-	. "github.com/xiaonanln/goworld/engine/kvdb/types"
+	"github.com/xiaonanln/goworld/engine/kvdb/types"
 )
 
 const (
@@ -27,9 +26,9 @@ func (ki keyTreeItem) Less(_other btree.Item) bool {
 	return ki.key < _other.(keyTreeItem).key
 }
 
-// Open Redis for KVDB backend
-func OpenRedisKVDB(host string, dbindex int) (KVDBEngine, error) {
-	c, err := redis.Dial("tcp", host)
+// OpenRedisKVDB opens Redis for KVDB backend
+func OpenRedisKVDB(url string, dbindex int) (kvdbtypes.KVDBEngine, error) {
+	c, err := redis.DialURL(url)
 	if err != nil {
 		return nil, errors.Wrap(err, "redis dail failed")
 	}
@@ -38,6 +37,7 @@ func OpenRedisKVDB(host string, dbindex int) (KVDBEngine, error) {
 		c:       c,
 		keyTree: btree.New(2),
 	}
+
 	if err := db.initialize(dbindex); err != nil {
 		panic(errors.Wrap(err, "redis kvdb initialize failed"))
 	}
@@ -46,8 +46,10 @@ func OpenRedisKVDB(host string, dbindex int) (KVDBEngine, error) {
 }
 
 func (db *redisKVDB) initialize(dbindex int) error {
-	if _, err := db.c.Do("SELECT", dbindex); err != nil {
-		return err
+	if dbindex >= 0 {
+		if _, err := db.c.Do("SELECT", dbindex); err != nil {
+			return err
+		}
 	}
 
 	keyMatch := keyPrefix + "*"
@@ -61,7 +63,6 @@ func (db *redisKVDB) initialize(dbindex int) error {
 		if err != nil {
 			return err
 		}
-		//gwlog.Info("SCAN: %v, nextcursor=%s", keys, string(nextCursor.([]byte)))
 		for _, key := range keys {
 			key := key[len(keyPrefix):]
 			db.keyTree.ReplaceOrInsert(keyTreeItem{key})
@@ -95,7 +96,7 @@ func (db *redisKVDB) Get(key string) (val string, err error) {
 
 func (db *redisKVDB) Put(key string, val string) error {
 	_, err := db.c.Do("SET", keyPrefix+key, val)
-	if err != nil {
+	if err == nil {
 		db.keyTree.ReplaceOrInsert(keyTreeItem{key})
 	}
 	return err
@@ -106,22 +107,22 @@ type redisKVDBIterator struct {
 	leftKeys []string
 }
 
-func (it *redisKVDBIterator) Next() (KVItem, error) {
+func (it *redisKVDBIterator) Next() (kvdbtypes.KVItem, error) {
 	if len(it.leftKeys) == 0 {
-		return KVItem{}, io.EOF
+		return kvdbtypes.KVItem{}, io.EOF
 	}
 
 	key := it.leftKeys[0]
 	it.leftKeys = it.leftKeys[1:]
 	val, err := it.db.Get(key)
 	if err != nil {
-		return KVItem{}, err
+		return kvdbtypes.KVItem{}, err
 	}
 
-	return KVItem{key, val}, nil
+	return kvdbtypes.KVItem{key, val}, nil
 }
 
-func (db *redisKVDB) Find(beginKey string, endKey string) Iterator {
+func (db *redisKVDB) Find(beginKey string, endKey string) (kvdbtypes.Iterator, error) {
 	keys := []string{} // retrive all keys in the range, ordered
 	db.keyTree.AscendRange(keyTreeItem{beginKey}, keyTreeItem{endKey}, func(it btree.Item) bool {
 		keys = append(keys, it.(keyTreeItem).key)
@@ -131,13 +132,13 @@ func (db *redisKVDB) Find(beginKey string, endKey string) Iterator {
 	return &redisKVDBIterator{
 		db:       db,
 		leftKeys: keys,
-	}
+	}, nil
 }
 
 func (db *redisKVDB) Close() {
 	db.c.Close()
 }
 
-func (db *redisKVDB) IsEOF(err error) bool {
+func (db *redisKVDB) IsConnectionError(err error) bool {
 	return err == io.EOF || err == io.ErrUnexpectedEOF
 }

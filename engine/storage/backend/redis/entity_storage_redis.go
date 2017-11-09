@@ -1,4 +1,4 @@
-package entity_storage_redis
+package entitystorageredis
 
 import (
 	"io"
@@ -7,7 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/netutil"
-	. "github.com/xiaonanln/goworld/engine/storage/storage_common"
+	"github.com/xiaonanln/goworld/engine/storage/storage_common"
 )
 
 var (
@@ -18,14 +18,17 @@ type redisEntityStorage struct {
 	c redis.Conn
 }
 
-func OpenRedis(host string, dbindex int) (EntityStorage, error) {
-	c, err := redis.Dial("tcp", host)
+// OpenRedis opens redis as entity storage
+func OpenRedis(url string, dbindex int) (storagecommon.EntityStorage, error) {
+	c, err := redis.DialURL(url)
 	if err != nil {
 		return nil, errors.Wrap(err, "redis dail failed")
 	}
 
-	if _, err := c.Do("SELECT", dbindex); err != nil {
-		return nil, errors.Wrap(err, "redis select db failed")
+	if dbindex >= 0 {
+		if _, err := c.Do("SELECT", dbindex); err != nil {
+			return nil, errors.Wrap(err, "redis select db failed")
+		}
 	}
 
 	es := &redisEntityStorage{

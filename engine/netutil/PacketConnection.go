@@ -12,16 +12,11 @@ import (
 
 	"sync/atomic"
 
-	"compress/flate"
-
-	"os"
-
-	"io"
-
 	"github.com/pkg/errors"
-	"github.com/xiaonanln/go-xnsyncutil/xnsyncutil"
 	"github.com/xiaonanln/goworld/engine/consts"
+	"github.com/xiaonanln/goworld/engine/gwioutil"
 	"github.com/xiaonanln/goworld/engine/gwlog"
+	"github.com/xiaonanln/goworld/engine/netutil/compress"
 	"github.com/xiaonanln/goworld/engine/opmon"
 )
 
@@ -34,22 +29,22 @@ const (
 
 var (
 	// NETWORK_ENDIAN is the network Endian of connections
-	NETWORK_ENDIAN      = binary.LittleEndian
-	errRecvAgain        = _ErrRecvAgain{}
-	compressWritersPool = xnsyncutil.NewNewlessPool()
+	NETWORK_ENDIAN = binary.LittleEndian
+	errRecvAgain   = _ErrRecvAgain{}
+	//compressWritersPool = xnsyncutil.NewNewlessPool()
 )
 
 func init() {
-	for i := 0; i < consts.COMPRESS_WRITER_POOL_SIZE; i++ {
-		cw, err := flate.NewWriter(os.Stderr, flate.BestSpeed)
-		if err != nil {
-			gwlog.Fatalf("create flate compressor failed: %v", err)
-		}
+	//for i := 0; i < consts.COMPRESS_WRITER_POOL_SIZE; i++ {
+	//	cw, err := flate.NewWriter(os.Stderr, flate.BestSpeed)
+	//	if err != nil {
+	//		gwlog.Fatalf("create flate compressor failed: %v", err)
+	//	}
+	//
+	//	compressWritersPool.Put(cw)
+	//}
 
-		compressWritersPool.Put(cw)
-	}
-
-	gwlog.Info("%d compress writer created.", consts.COMPRESS_WRITER_POOL_SIZE)
+	//gwlog.Infof("%d compress writer created.", consts.COMPRESS_WRITER_POOL_SIZE)
 }
 
 type _ErrRecvAgain struct{}
@@ -63,16 +58,15 @@ func (err _ErrRecvAgain) Temporary() bool {
 }
 
 func (err _ErrRecvAgain) Timeout() bool {
-	return false
+	return true
 }
 
-// PacketConnection is a connection that send and receive data packets
+// PacketConnection is a connection that send and receive data packets upon a network stream connection
 type PacketConnection struct {
 	conn               Connection
 	compressed         bool
 	pendingPackets     []*Packet
 	pendingPacketsLock sync.Mutex
-	sendBuffer         *SendBuffer // each PacketConnection uses 1 SendBuffer for sending packets
 
 	// buffers and infos for receiving a packet
 	payloadLenBuf         [_SIZE_FIELD_SIZE]byte
@@ -81,19 +75,17 @@ type PacketConnection struct {
 	recvTotalPayloadLen   uint32
 	recvedPayloadLen      uint32
 	recvingPacket         *Packet
-
-	compressReader io.ReadCloser
+	compressor            compress.Compressor
 }
 
 // NewPacketConnection creates a packet connection based on network connection
-func NewPacketConnection(conn Connection, compressed bool) *PacketConnection {
+func NewPacketConnection(conn Connection, compressor compress.Compressor) *PacketConnection {
 	pc := &PacketConnection{
 		conn:       conn,
-		sendBuffer: NewSendBuffer(),
-		compressed: compressed,
+		compressed: compressor != nil,
 	}
 
-	pc.compressReader = flate.NewReader(os.Stdin) // reader is always needed
+	pc.compressor = compressor
 	return pc
 }
 
@@ -105,7 +97,7 @@ func (pc *PacketConnection) NewPacket() *Packet {
 // SendPacket send packets to remote
 func (pc *PacketConnection) SendPacket(packet *Packet) error {
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s SEND PACKET %p: msgtype=%v, payload(%d)=%v", pc, packet,
+		gwlog.Debugf("%s SEND PACKET %p: msgtype=%v, payload(%d)=%v", pc, packet,
 			packetEndian.Uint16(packet.bytes[_PREPAYLOAD_SIZE:_PREPAYLOAD_SIZE+2]),
 			packet.GetPayloadLen(),
 			packet.bytes[_PREPAYLOAD_SIZE+2:_PREPAYLOAD_SIZE+packet.GetPayloadLen()])
@@ -122,7 +114,7 @@ func (pc *PacketConnection) SendPacket(packet *Packet) error {
 }
 
 // Flush connection writes
-func (pc *PacketConnection) Flush() (err error) {
+func (pc *PacketConnection) Flush(reason string) (err error) {
 	pc.pendingPacketsLock.Lock()
 	if len(pc.pendingPackets) == 0 { // no packets to send, common to happen, so handle efficiently
 		pc.pendingPacketsLock.Unlock()
@@ -133,28 +125,20 @@ func (pc *PacketConnection) Flush() (err error) {
 	pc.pendingPacketsLock.Unlock()
 
 	// flush should only be called in one goroutine
-	op := opmon.StartOperation("FlushPackets")
-	defer op.Finish(time.Millisecond * 100)
+	op := opmon.StartOperation("FlushPackets-" + reason)
+	defer op.Finish(time.Millisecond * 300)
 
-	var cw *flate.Writer
+	//var cw *flate.Writer
 
 	if len(packets) == 1 {
 		// only 1 packet to send, just send it directly, no need to use send buffer
 		packet := packets[0]
-		if cw == nil && pc.compressed && packet.requireCompress() {
-			_cw := compressWritersPool.TryGet() // try to get a usable compress writer, might fail
-			if _cw != nil {
-				cw = _cw.(*flate.Writer)
-				defer compressWritersPool.Put(cw)
-			} else {
-				gwlog.Warn("Fail to get compressor, packet is not compressed")
-			}
+
+		if pc.compressed && packet.requireCompress() {
+			packet.compress(pc.compressor)
 		}
 
-		if cw != nil {
-			packet.compress(cw)
-		}
-		err = WriteAll(pc.conn, packet.data())
+		err = gwioutil.WriteAll(pc.conn, packet.data())
 		packet.Release()
 		if err == nil {
 			err = pc.conn.Flush()
@@ -162,54 +146,16 @@ func (pc *PacketConnection) Flush() (err error) {
 		return
 	}
 
-	sendBuffer := pc.sendBuffer // the send buffer
-
-send_packets_loop:
 	for _, packet := range packets {
-		if cw == nil && pc.compressed && packet.requireCompress() {
-			_cw := compressWritersPool.TryGet() // try to get a usable compress writer, might fail
-			if _cw != nil {
-				cw = _cw.(*flate.Writer)
-				//noinspection GoDeferInLoop
-				defer compressWritersPool.Put(cw)
-			} else {
-				gwlog.Warn("Fail to get compressor, packet is not compressed")
-			}
+		if pc.compressed && packet.requireCompress() {
+			packet.compress(pc.compressor)
 		}
 
-		if cw != nil {
-			packet.compress(cw)
-		}
-
-		packetData := packet.data()
-		if len(packetData) > sendBuffer.FreeSpace() {
-			// can not append data to send buffer, so clear send buffer first
-			if err = sendBuffer.WriteAllTo(pc.conn); err != nil {
-				return err
-			}
-
-			if len(packetData) >= _SEND_BUFFER_SIZE {
-				// packet is too large, impossible to put to send buffer
-				err = WriteAll(pc.conn, packetData)
-				packet.Release()
-
-				if err != nil {
-					return
-				}
-				continue send_packets_loop
-			}
-		}
-
-		// now we are sure that len(packetData) <= sendBuffer.FreeSize()
-		n, _ := sendBuffer.Write(packetData)
-		if n != len(packetData) {
-			gwlog.Panicf("packet is not fully written")
-		}
+		gwioutil.WriteAll(pc.conn, packet.data())
 		packet.Release()
 	}
 
 	// now we send all data in the send buffer
-	err = sendBuffer.WriteAllTo(pc.conn)
 	if err == nil {
 		err = pc.conn.Flush()
 	}
@@ -239,7 +185,7 @@ func (pc *PacketConnection) RecvPacket() (*Packet, error) {
 		if pc.recvCompressed {
 			gwlog.Panicf("should be false")
 		}
-		if pc.recvTotalPayloadLen&_COMPRESSED_BIT_MASK != 0 {
+		if pc.recvTotalPayloadLen&_PAYLOAD_COMPRESSED_BIT_MASK != 0 {
 			pc.recvTotalPayloadLen &= _PAYLOAD_LEN_MASK
 			pc.recvCompressed = true
 		}
@@ -253,7 +199,7 @@ func (pc *PacketConnection) RecvPacket() (*Packet, error) {
 
 		pc.recvedPayloadLen = 0
 		pc.recvingPacket = NewPacket()
-		pc.recvingPacket.assureCapacity(pc.recvTotalPayloadLen)
+		pc.recvingPacket.AssureCapacity(pc.recvTotalPayloadLen)
 	}
 
 	// now all bytes of payload len is received, start receiving payload
@@ -265,7 +211,7 @@ func (pc *PacketConnection) RecvPacket() (*Packet, error) {
 		packet := pc.recvingPacket
 		packet.setPayloadLenCompressed(pc.recvTotalPayloadLen, pc.recvCompressed)
 		pc.resetRecvStates()
-		packet.decompress(pc.compressReader)
+		packet.decompress(pc.compressor)
 
 		return packet, nil
 	}

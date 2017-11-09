@@ -7,6 +7,6 @@ type Monster struct {
 	entity.Entity // Entity type should always inherit entity.Entity
 }
 
-func (e *Monster) OnCreated() {
-	e.Entity.OnCreated()
+func (m *Monster) DefineAttrs(desc *entity.EntityTypeDesc) {
+	desc.DefineAttr("name", "AllClients")
 }

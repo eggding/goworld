@@ -1,4 +1,4 @@
-package entity_storage_mongodb
+package entitystoragemongodb
 
 import (
 	"gopkg.in/mgo.v2"
@@ -8,24 +8,24 @@ import (
 
 	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/gwlog"
-
-	. "github.com/xiaonanln/goworld/engine/storage/storage_common"
+	"github.com/xiaonanln/goworld/engine/storage/storage_common"
 )
 
 const (
-	DEFAULT_DB_NAME = "goworld"
+	_DEFAULT_DB_NAME = "goworld"
 )
 
 var (
 	db *mgo.Database
 )
 
-type MongoDBEntityStorge struct {
+type mongoDBEntityStorge struct {
 	db *mgo.Database
 }
 
-func OpenMongoDB(url string, dbname string) (EntityStorage, error) {
-	gwlog.Debug("Connecting MongoDB ...")
+// OpenMongoDB opens mongodb as entity storage
+func OpenMongoDB(url string, dbname string) (storagecommon.EntityStorage, error) {
+	gwlog.Debugf("Connecting MongoDB ...")
 	session, err := mgo.Dial(url)
 	if err != nil {
 		return nil, err
@@ -34,15 +34,15 @@ func OpenMongoDB(url string, dbname string) (EntityStorage, error) {
 	session.SetMode(mgo.Monotonic, true)
 	if dbname == "" {
 		// if db is not specified, use default
-		dbname = DEFAULT_DB_NAME
+		dbname = _DEFAULT_DB_NAME
 	}
 	db = session.DB(dbname)
-	return &MongoDBEntityStorge{
+	return &mongoDBEntityStorge{
 		db: db,
 	}, nil
 }
 
-func (es *MongoDBEntityStorge) Write(typeName string, entityID common.EntityID, data interface{}) error {
+func (es *mongoDBEntityStorge) Write(typeName string, entityID common.EntityID, data interface{}) error {
 	col := es.getCollection(typeName)
 	_, err := col.UpsertId(entityID, bson.M{
 		"data": data,
@@ -50,7 +50,7 @@ func (es *MongoDBEntityStorge) Write(typeName string, entityID common.EntityID, 
 	return err
 }
 
-func (es *MongoDBEntityStorge) Read(typeName string, entityID common.EntityID) (interface{}, error) {
+func (es *mongoDBEntityStorge) Read(typeName string, entityID common.EntityID) (interface{}, error) {
 	col := es.getCollection(typeName)
 	q := col.FindId(entityID)
 	var doc bson.M
@@ -61,7 +61,7 @@ func (es *MongoDBEntityStorge) Read(typeName string, entityID common.EntityID) (
 	return es.convertM2Map(doc["data"].(bson.M)), nil
 }
 
-func (es *MongoDBEntityStorge) convertM2Map(m bson.M) map[string]interface{} {
+func (es *mongoDBEntityStorge) convertM2Map(m bson.M) map[string]interface{} {
 	ma := map[string]interface{}(m)
 	for k, v := range ma {
 		if m, ok := v.(bson.M); ok {
@@ -71,11 +71,11 @@ func (es *MongoDBEntityStorge) convertM2Map(m bson.M) map[string]interface{} {
 	return ma
 }
 
-func (es *MongoDBEntityStorge) getCollection(typeName string) *mgo.Collection {
+func (es *mongoDBEntityStorge) getCollection(typeName string) *mgo.Collection {
 	return es.db.C(typeName)
 }
 
-func (es *MongoDBEntityStorge) List(typeName string) ([]common.EntityID, error) {
+func (es *mongoDBEntityStorge) List(typeName string) ([]common.EntityID, error) {
 	col := es.getCollection(typeName)
 	var docs []bson.M
 	err := col.Find(nil).Select(bson.M{"_id": 1}).All(&docs)
@@ -90,7 +90,7 @@ func (es *MongoDBEntityStorge) List(typeName string) ([]common.EntityID, error) 
 	return entityIDs, nil
 }
 
-func (es *MongoDBEntityStorge) Exists(typeName string, entityID common.EntityID) (bool, error) {
+func (es *mongoDBEntityStorge) Exists(typeName string, entityID common.EntityID) (bool, error) {
 	col := es.getCollection(typeName)
 	query := col.FindId(entityID)
 	var doc bson.M
@@ -105,10 +105,10 @@ func (es *MongoDBEntityStorge) Exists(typeName string, entityID common.EntityID)
 	}
 }
 
-func (es *MongoDBEntityStorge) Close() {
+func (es *mongoDBEntityStorge) Close() {
 	es.db.Session.Close()
 }
 
-func (es *MongoDBEntityStorge) IsEOF(err error) bool {
+func (es *mongoDBEntityStorge) IsEOF(err error) bool {
 	return err == io.EOF || err == io.ErrUnexpectedEOF
 }

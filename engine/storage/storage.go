@@ -16,12 +16,13 @@ import (
 	"github.com/xiaonanln/goworld/engine/post"
 	"github.com/xiaonanln/goworld/engine/storage/backend/filesystem"
 	"github.com/xiaonanln/goworld/engine/storage/backend/mongodb"
+	"github.com/xiaonanln/goworld/engine/storage/backend/mysql"
 	"github.com/xiaonanln/goworld/engine/storage/backend/redis"
-	. "github.com/xiaonanln/goworld/engine/storage/storage_common"
+	"github.com/xiaonanln/goworld/engine/storage/storage_common"
 )
 
 var (
-	storageEngine            EntityStorage
+	storageEngine            storagecommon.EntityStorage
 	operationQueue           = xnsyncutil.NewSyncQueue()
 	storageRoutineTerminated = xnsyncutil.NewOneTimeCond()
 )
@@ -50,10 +51,17 @@ type listEntityIDsRequest struct {
 	Callback ListCallbackFunc
 }
 
-type SaveCallbackFunc func()                            // SaveCallbackFunc is the callback type of storage Save
-type LoadCallbackFunc func(data interface{}, err error) // LoadCallbackFunc is the callback type of storage Load
-type ExistsCallbackFunc func(exists bool, err error)    // ExistsCallbackFunc is the callback type of storage Exists
-type ListCallbackFunc func([]common.EntityID, error)    // ListCallbackFunc is the callback type of storage List
+// SaveCallbackFunc is the callback type of storage Save
+type SaveCallbackFunc func()
+
+// LoadCallbackFunc is the callback type of storage Load
+type LoadCallbackFunc func(data interface{}, err error)
+
+// ExistsCallbackFunc is the callback type of storage Exists
+type ExistsCallbackFunc func(exists bool, err error)
+
+// ListCallbackFunc is the callback type of storage List
+type ListCallbackFunc func([]common.EntityID, error)
 
 // Save saves entity data to storage
 func Save(typeName string, entityID common.EntityID, data interface{}, callback SaveCallbackFunc) {
@@ -102,18 +110,14 @@ var recentWarnedQueueLen = 0
 func checkOperationQueueLen() {
 	qlen := operationQueue.Len()
 	if qlen > 100 && qlen%100 == 0 && recentWarnedQueueLen != qlen {
-		gwlog.Warn("Storage operation queue length = %d", qlen)
+		gwlog.Warnf("Storage operation queue length = %d", qlen)
 		recentWarnedQueueLen = qlen
 	}
 }
 
-// Close storage module
-func Close() {
+// Shutdown storage module
+func Shutdown() {
 	operationQueue.Close()
-}
-
-// WaitTerminated waits for storage module to terminate
-func WaitTerminated() {
 	storageRoutineTerminated.Wait()
 }
 
@@ -135,11 +139,20 @@ func assureStorageEngineReady() (err error) {
 	if cfg.Type == "filesystem" {
 		storageEngine, err = entitystoragefilesystem.OpenDirectory(cfg.Directory)
 	} else if cfg.Type == "mongodb" {
-		storageEngine, err = entity_storage_mongodb.OpenMongoDB(cfg.Url, cfg.DB)
+		storageEngine, err = entitystoragemongodb.OpenMongoDB(cfg.Url, cfg.DB)
 	} else if cfg.Type == "redis" {
-		var dbindex int
-		if dbindex, err = strconv.Atoi(cfg.DB); err == nil {
-			storageEngine, err = entity_storage_redis.OpenRedis(cfg.Host, dbindex)
+		var dbindex int = -1
+		if cfg.DB != "" {
+			if dbindex, err = strconv.Atoi(cfg.DB); err != nil {
+				return err
+			}
+		}
+		storageEngine, err = entitystorageredis.OpenRedis(cfg.Url, dbindex)
+	} else if cfg.Type == "sql" {
+		if cfg.Driver == "mysql" {
+			storageEngine, err = entitystoragemysql.OpenMySQL(cfg.Url)
+		} else {
+			gwlog.Panicf("unknown sql driver: %s", cfg.Driver)
 		}
 	} else {
 		gwlog.Panicf("unknown storage type: %s", cfg.Type)
@@ -167,7 +180,7 @@ func storageRoutine() {
 	for {
 		err := assureStorageEngineReady()
 		if err != nil {
-			gwlog.Error("Storage engine is not ready: %s", err)
+			gwlog.Errorf("Storage engine is not ready: %s", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -183,11 +196,11 @@ func storageRoutine() {
 			monop = opmon.StartOperation("storage.save")
 			for {
 				if consts.DEBUG_SAVE_LOAD {
-					gwlog.Debug("storage: SAVING %s %s ...", saveReq.TypeName, saveReq.EntityID)
+					gwlog.Debugf("storage: SAVING %s %s ...", saveReq.TypeName, saveReq.EntityID)
 				}
 				err := assureStorageEngineReady()
 				if err != nil {
-					gwlog.Error("Storage engine is not ready: %s", err)
+					gwlog.Errorf("Storage engine is not ready: %s", err)
 					time.Sleep(time.Second) // wait for 1 second to retry
 					continue
 				}
@@ -199,7 +212,7 @@ func storageRoutine() {
 				err = storageEngine.Write(saveReq.TypeName, saveReq.EntityID, saveReq.Data)
 				if err != nil {
 					// save failed ?
-					gwlog.Error("storage: save failed: %s", err)
+					gwlog.Errorf("storage: save failed: %s", err)
 
 					if err != nil && storageEngine.IsEOF(err) {
 						storageEngine.Close()
@@ -219,7 +232,7 @@ func storageRoutine() {
 			}
 		} else if loadReq, ok := op.(loadRequest); ok {
 			// handle load request
-			gwlog.Debug("storage: LOADING %s %s ...", loadReq.TypeName, loadReq.EntityID)
+			gwlog.Debugf("storage: LOADING %s %s ...", loadReq.TypeName, loadReq.EntityID)
 			monop = opmon.StartOperation("storage.load")
 			data, err := storageEngine.Read(loadReq.TypeName, loadReq.EntityID)
 			if err != nil {

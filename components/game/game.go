@@ -8,6 +8,7 @@ import (
 
 	"os"
 
+	// for go tool pprof
 	_ "net/http/pprof"
 
 	"runtime"
@@ -16,8 +17,10 @@ import (
 
 	"syscall"
 
-	"github.com/xiaonanln/goworld/components/binutil"
+	"fmt"
+
 	"github.com/xiaonanln/goworld/components/dispatcher/dispatcherclient"
+	"github.com/xiaonanln/goworld/engine/binutil"
 	"github.com/xiaonanln/goworld/engine/config"
 	"github.com/xiaonanln/goworld/engine/crontab"
 	"github.com/xiaonanln/goworld/engine/entity"
@@ -33,14 +36,11 @@ var (
 	configFile                   string
 	logLevel                     string
 	restore                      bool
-	gameService                  *GameService
+	runInDaemonMode              bool
+	gameService                  *_GameService
 	signalChan                   = make(chan os.Signal, 1)
 	gameDispatcherClientDelegate = &dispatcherClientDelegate{}
 )
-
-func init() {
-	parseArgs()
-}
 
 func parseArgs() {
 	var gameidArg int
@@ -48,31 +48,46 @@ func parseArgs() {
 	flag.StringVar(&configFile, "configfile", "", "set config file path")
 	flag.StringVar(&logLevel, "log", "", "set log level, will override log level in config")
 	flag.BoolVar(&restore, "restore", false, "restore from freezed state")
+	flag.BoolVar(&runInDaemonMode, "d", false, "run in daemon mode")
 	flag.Parse()
 	gameid = uint16(gameidArg)
 }
 
+// Run runs the game server
+//
+// This is the main game server loop
 func Run(delegate IGameDelegate) {
 	rand.Seed(time.Now().UnixNano())
+	parseArgs()
+
+	if runInDaemonMode {
+		daemoncontext := binutil.Daemonize()
+		defer daemoncontext.Release()
+	}
 
 	if configFile != "" {
 		config.SetConfigFile(configFile)
 	}
 
+	if gameid <= 0 {
+		gwlog.Errorf("gameid %d is not valid, should be positive", gameid)
+		os.Exit(1)
+	}
+
 	gameConfig := config.GetGame(gameid)
 	if gameConfig == nil {
-		gwlog.Error("game %d's config is not found", gameid)
+		gwlog.Errorf("game %d's config is not found", gameid)
 		os.Exit(1)
 	}
 
 	if gameConfig.GoMaxProcs > 0 {
-		gwlog.Info("SET GOMAXPROCS = %d", gameConfig.GoMaxProcs)
+		gwlog.Infof("SET GOMAXPROCS = %d", gameConfig.GoMaxProcs)
 		runtime.GOMAXPROCS(gameConfig.GoMaxProcs)
 	}
 	if logLevel == "" {
 		logLevel = gameConfig.LogLevel
 	}
-	binutil.SetupGWLog(logLevel, gameConfig.LogFile, gameConfig.LogStderr)
+	binutil.SetupGWLog(fmt.Sprintf("game%d", gameid), logLevel, gameConfig.LogFile, gameConfig.LogStderr)
 
 	storage.Initialize()
 	kvdb.Initialize()
@@ -92,8 +107,8 @@ func Run(delegate IGameDelegate) {
 }
 
 func setupSignals() {
-	gwlog.Info("Setup signals ...")
-	signal.Ignore(syscall.Signal(12))
+	gwlog.Infof("Setup signals ...")
+	signal.Ignore(syscall.Signal(12), syscall.SIGPIPE)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.Signal(10))
 
 	go func() {
@@ -101,26 +116,25 @@ func setupSignals() {
 			sig := <-signalChan
 			if sig == syscall.SIGTERM {
 				// terminating game ...
-				gwlog.Info("Terminating game service ...")
+				gwlog.Infof("Terminating game service ...")
 				gameService.terminate()
 				waitGameServiceStateSatisfied(func(rs int) bool {
 					return rs != rsTerminating
 				})
 				if gameService.runState.Load() != rsTerminated {
 					// game service is not terminated successfully, abort
-					gwlog.Error("Game service is not terminated successfully, back to running ...")
+					gwlog.Errorf("Game service is not terminated successfully, back to running ...")
 					continue
 				}
 
-				waitKVDBFinish()
 				waitEntityStorageFinish()
 
-				gwlog.Info("Game %d shutdown gracefully.", gameid)
+				gwlog.Infof("Game %d shutdown gracefully.", gameid)
 				os.Exit(0)
 			} else if sig == syscall.Signal(10) || sig == syscall.SIGINT {
 				// SIGUSR1 => dump game and close
 				// freezing game ...
-				gwlog.Info("Freezing game service ...")
+				gwlog.Infof("Freezing game service ...")
 
 				gameService.freeze()
 				waitGameServiceStateSatisfied(func(rs int) bool { // wait until not running
@@ -132,49 +146,45 @@ func setupSignals() {
 
 				if gameService.runState.Load() != rsFreezed {
 					// game service is not freezed successfully, abort
-					gwlog.Error("Game service is not freezed successfully, back to running ...")
+					gwlog.Errorf("Game service is not freezed successfully, back to running ...")
 					continue
 				}
 
-				waitKVDBFinish()
 				waitEntityStorageFinish()
 
-				gwlog.Info("Game %d freezed gracefully.", gameid)
+				gwlog.Infof("Game %d freezed gracefully.", gameid)
 				os.Exit(0)
 			} else {
-				gwlog.Error("unexpected signal: %s", sig)
+				gwlog.Errorf("unexpected signal: %s", sig)
 			}
 		}
 	}()
 }
 
 func waitGameServiceStateSatisfied(s func(rs int) bool) {
+	waitCounter := 0
 	for {
 		state := gameService.runState.Load()
-		gwlog.Info("game service status: %d", state)
 		if s(state) {
 			break
 		}
-		time.Sleep(time.Millisecond * 100)
+		waitCounter++
+		if waitCounter%10 == 0 {
+			gwlog.Infof("game service status: %d", state)
+		}
+		time.Sleep(time.Millisecond * 10)
 	}
-}
-
-func waitKVDBFinish() {
-	// wait until kvdb's queue is empty
-	gwlog.Info("Closing KVDB ...")
-	kvdb.Close()
-	kvdb.WaitTerminated()
 }
 
 func waitEntityStorageFinish() {
 	// wait until entity storage's queue is empty
-	gwlog.Info("Closing Entity Storage ...")
-	storage.Close()
-	storage.WaitTerminated()
-	gwlog.Info("*** DB OK ***")
+	gwlog.Infof("Closing Entity Storage ...")
+	storage.Shutdown()
+	gwlog.Infof("*** DB OK ***")
 }
 
 type dispatcherClientDelegate struct {
+	lastCollectEntitySyncInfosTime time.Time
 }
 
 func (delegate *dispatcherClientDelegate) OnDispatcherClientConnect(dispatcherClient *dispatcherclient.DispatcherClient, isReconnect bool) {
@@ -207,14 +217,19 @@ func (delegate *dispatcherClientDelegate) HandleDispatcherClientPacket(msgtype p
 }
 
 func (delegate *dispatcherClientDelegate) HandleDispatcherClientDisconnect() {
-	gwlog.Error("Disconnected from dispatcher, try reconnecting ...")
+	gwlog.Errorf("Disconnected from dispatcher, try reconnecting ...")
 }
 
 func (delegate *dispatcherClientDelegate) HandleDispatcherClientBeforeFlush() {
 	// collect all sync infos from entities and group them by target gates
-	entity.CollectEntitySyncInfos()
+	now := time.Now()
+	if now.Sub(delegate.lastCollectEntitySyncInfosTime) >= time.Millisecond*100 {
+		delegate.lastCollectEntitySyncInfosTime = now
+		entity.CollectEntitySyncInfos()
+	}
 }
 
+// GetGameID returns the current Game Server ID
 func GetGameID() uint16 {
 	return gameid
 }

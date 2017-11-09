@@ -10,40 +10,38 @@ import (
 	"time"
 
 	"github.com/xiaonanln/goworld/engine/consts"
+	"github.com/xiaonanln/goworld/engine/gwioutil"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 	"github.com/xiaonanln/goworld/engine/netutil"
 	"github.com/xiaonanln/goworld/engine/proto"
 )
 
-type DispatcherClientProxy struct {
+type dispatcherClientProxy struct {
 	*proto.GoWorldConnection
 	owner  *DispatcherService
 	gameid uint16
 	gateid uint16
 }
 
-func newDispatcherClientProxy(owner *DispatcherService, _conn net.Conn) *DispatcherClientProxy {
+func newDispatcherClientProxy(owner *DispatcherService, _conn net.Conn) *dispatcherClientProxy {
 	conn := netutil.NetConnection{_conn}
-	//if consts.DISPATCHER_CLIENT_PROXY_BUFFERED_DELAY > 0 {
-	//	conn = netutil.NewBufferedConnection(conn, consts.DISPATCHER_CLIENT_PROXY_BUFFERED_DELAY)
-	//}
-	gwc := proto.NewGoWorldConnection(netutil.NewBufferedReadConnection(conn), false)
+	gwc := proto.NewGoWorldConnection(netutil.NewBufferedConnection(conn), false, "")
 
-	dcp := &DispatcherClientProxy{
+	dcp := &dispatcherClientProxy{
 		GoWorldConnection: gwc,
 		owner:             owner,
 	}
 	return dcp
 }
 
-func (dcp *DispatcherClientProxy) startAutoFlush() {
+func (dcp *dispatcherClientProxy) startAutoFlush() {
 	go func() {
 		gwc := dcp.GoWorldConnection
-		defer gwlog.Debug("%s: auto flush routine quited", gwc)
+		//defer gwlog.Debugf("%s: auto flush routine quited", gwc)
 		for !gwc.IsClosed() {
-			time.Sleep(time.Millisecond * 10)
+			time.Sleep(consts.DISPATCHER_CLIENT_PROXY_WRITE_FLUSH_INTERVAL)
 			dcp.beforeFlush()
-			err := gwc.Flush()
+			err := gwc.Flush("DispatcherClientProxy")
 			if err != nil {
 				break
 			}
@@ -51,7 +49,7 @@ func (dcp *DispatcherClientProxy) startAutoFlush() {
 	}()
 }
 
-func (dcp *DispatcherClientProxy) serve() {
+func (dcp *dispatcherClientProxy) serve() {
 	// Serve the dispatcher client from server / gate
 	defer func() {
 		dcp.Close()
@@ -62,22 +60,25 @@ func (dcp *DispatcherClientProxy) serve() {
 		}
 	}()
 
-	gwlog.Info("New dispatcher client: %s", dcp)
+	gwlog.Infof("New dispatcher client: %s", dcp)
 	for {
 		var msgtype proto.MsgType
 		pkt, err := dcp.Recv(&msgtype)
 
 		if err != nil {
-			if netutil.IsTemporaryNetError(err) {
+			if gwioutil.IsTimeoutError(err) {
 				continue
+			} else if netutil.IsConnectionError(err) {
+				break
 			}
 
 			gwlog.Panic(err)
 		}
 
 		if consts.DEBUG_PACKETS {
-			gwlog.Debug("%s.RecvPacket: msgtype=%v, payload=%v", dcp, msgtype, pkt.Payload())
+			gwlog.Debugf("%s.RecvPacket: msgtype=%v, payload=%v", dcp, msgtype, pkt.Payload())
 		}
+
 		if msgtype == proto.MT_SYNC_POSITION_YAW_FROM_CLIENT {
 			dcp.owner.handleSyncPositionYawFromClient(dcp, pkt)
 		} else if msgtype == proto.MT_SYNC_POSITION_YAW_ON_CLIENTS {
@@ -112,30 +113,10 @@ func (dcp *DispatcherClientProxy) serve() {
 			dcp.owner.handleDeclareService(dcp, pkt)
 		} else if msgtype == proto.MT_SET_GAME_ID {
 			// this is a game server
-			gameid := pkt.ReadUint16()
-			isReconnect := pkt.ReadBool()
-			isRestore := pkt.ReadBool()
-			if gameid <= 0 {
-				gwlog.Panicf("invalid gameid: %d", gameid)
-			}
-			if dcp.gameid > 0 || dcp.gateid > 0 {
-				gwlog.Panicf("already set gameid=%d, gateid=%d", dcp.gameid, dcp.gateid)
-			}
-			dcp.gameid = gameid
-			dcp.startAutoFlush()
-			dcp.owner.handleSetGameID(dcp, pkt, gameid, isReconnect, isRestore)
+			dcp.owner.handleSetGameID(dcp, pkt)
 		} else if msgtype == proto.MT_SET_GATE_ID {
 			// this is a gate
-			gateid := pkt.ReadUint16()
-			if gateid <= 0 {
-				gwlog.Panicf("invalid gateid: %d", gateid)
-			}
-			if dcp.gameid > 0 || dcp.gateid > 0 {
-				gwlog.Panicf("already set gameid=%d, gateid=%d", dcp.gameid, dcp.gateid)
-			}
-			dcp.gateid = gateid
-			dcp.startAutoFlush()
-			dcp.owner.handleSetGateID(dcp, pkt, gateid)
+			dcp.owner.handleSetGateID(dcp, pkt)
 		} else if msgtype == proto.MT_START_FREEZE_GAME {
 			// freeze the game
 			dcp.owner.handleStartFreezeGame(dcp, pkt)
@@ -150,17 +131,17 @@ func (dcp *DispatcherClientProxy) serve() {
 	}
 }
 
-func (dcp *DispatcherClientProxy) String() string {
+func (dcp *dispatcherClientProxy) String() string {
 	if dcp.gameid > 0 {
-		return fmt.Sprintf("DispatcherClientProxy<game%d|%s>", dcp.gameid, dcp.RemoteAddr())
+		return fmt.Sprintf("dispatcherClientProxy<game%d|%s>", dcp.gameid, dcp.RemoteAddr())
 	} else if dcp.gateid > 0 {
-		return fmt.Sprintf("DispatcherClientProxy<gate%d|%s>", dcp.gateid, dcp.RemoteAddr())
+		return fmt.Sprintf("dispatcherClientProxy<gate%d|%s>", dcp.gateid, dcp.RemoteAddr())
 	} else {
-		return fmt.Sprintf("DispatcherClientProxy<%s>", dcp.RemoteAddr())
+		return fmt.Sprintf("dispatcherClientProxy<%s>", dcp.RemoteAddr())
 	}
 }
 
-func (dcp *DispatcherClientProxy) beforeFlush() {
+func (dcp *dispatcherClientProxy) beforeFlush() {
 	// Collect all entity sync infos to this game before flush
 	if dcp.gameid > 0 {
 		entitySyncInfos := dcp.owner.popEntitySyncInfosToGame(dcp.gameid)

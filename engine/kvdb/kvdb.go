@@ -7,20 +7,21 @@ import (
 
 	"strconv"
 
-	"github.com/xiaonanln/go-xnsyncutil/xnsyncutil"
+	"github.com/xiaonanln/goworld/engine/async"
 	"github.com/xiaonanln/goworld/engine/config"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 	"github.com/xiaonanln/goworld/engine/kvdb/backend/kvdb_mongodb"
+	"github.com/xiaonanln/goworld/engine/kvdb/backend/kvdbmysql"
 	"github.com/xiaonanln/goworld/engine/kvdb/backend/kvdbredis"
-	. "github.com/xiaonanln/goworld/engine/kvdb/types"
-	"github.com/xiaonanln/goworld/engine/opmon"
-	"github.com/xiaonanln/goworld/engine/post"
+	"github.com/xiaonanln/goworld/engine/kvdb/types"
+)
+
+const (
+	_KVDB_ASYNC_JOB_GROUP = "_kvdb"
 )
 
 var (
-	kvdbEngine     KVDBEngine
-	kvdbOpQueue    *xnsyncutil.SyncQueue
-	kvdbTerminated *xnsyncutil.OneTimeCond
+	kvdbEngine kvdbtypes.KVDBEngine
 )
 
 // KVDBGetCallback is type of KVDB Get callback
@@ -30,7 +31,10 @@ type KVDBGetCallback func(val string, err error)
 type KVDBPutCallback func(err error)
 
 // KVDBGetRangeCallback is type of KVDB GetRange callback
-type KVDBGetRangeCallback func(items []KVItem, err error)
+type KVDBGetRangeCallback func(items []kvdbtypes.KVItem, err error)
+
+// KVDBGetOrPutCallback is type of KVDB GetOrPut callback
+type KVDBGetOrPutCallback func(oldVal string, err error)
 
 // Initialize the KVDB
 //
@@ -41,13 +45,8 @@ func Initialize() {
 		return
 	}
 
-	gwlog.Info("KVDB initializing, config:\n%s", config.DumpPretty(kvdbCfg))
-	kvdbOpQueue = xnsyncutil.NewSyncQueue()
-	kvdbTerminated = xnsyncutil.NewOneTimeCond()
-
+	gwlog.Infof("KVDB initializing, config:\n%s", config.DumpPretty(kvdbCfg))
 	assureKVDBEngineReady()
-
-	go kvdbRoutine()
 }
 
 func assureKVDBEngineReady() (err error) {
@@ -58,12 +57,21 @@ func assureKVDBEngineReady() (err error) {
 	kvdbCfg := config.GetKVDB()
 
 	if kvdbCfg.Type == "mongodb" {
-		kvdbEngine, err = kvdb_mongo.OpenMongoKVDB(kvdbCfg.Url, kvdbCfg.DB, kvdbCfg.Collection)
+		kvdbEngine, err = kvdbmongo.OpenMongoKVDB(kvdbCfg.Url, kvdbCfg.DB, kvdbCfg.Collection)
 	} else if kvdbCfg.Type == "redis" {
-		var dbindex int
-		dbindex, err = strconv.Atoi(kvdbCfg.DB)
-		if err == nil {
-			kvdbEngine, err = kvdbredis.OpenRedisKVDB(kvdbCfg.Host, dbindex)
+		var dbindex int = -1
+		if kvdbCfg.DB != "" {
+			dbindex, err = strconv.Atoi(kvdbCfg.DB)
+			if err != nil {
+				return err
+			}
+		}
+		kvdbEngine, err = kvdbredis.OpenRedisKVDB(kvdbCfg.Url, dbindex)
+	} else if kvdbCfg.Type == "sql" {
+		if kvdbCfg.Driver == "mysql" {
+			kvdbEngine, err = kvdbmysql.OpenMySQLKVDB(kvdbCfg.Url)
+		} else {
+			gwlog.Fatalf("KVDB mysql driver %s is unknown", kvdbCfg.Driver)
 		}
 	} else {
 		gwlog.Fatalf("KVDB type %s is not implemented", kvdbCfg.Type)
@@ -71,157 +79,126 @@ func assureKVDBEngineReady() (err error) {
 	return
 }
 
-type getReq struct {
-	key      string
-	callback KVDBGetCallback
-}
-
-type putReq struct {
-	key      string
-	val      string
-	callback KVDBPutCallback
-}
-
-type getRangeReq struct {
-	beginKey string
-	endKey   string
-	callback KVDBGetRangeCallback
-}
-
 // Get gets value of key from KVDB, returns in callback
 func Get(key string, callback KVDBGetCallback) {
-	kvdbOpQueue.Push(&getReq{
-		key, callback,
-	})
-	checkOperationQueueLen()
+	var ac async.AsyncCallback
+	if callback != nil {
+		ac = func(res interface{}, err error) {
+			if err != nil {
+				callback("", err)
+			} else {
+				callback(res.(string), nil)
+			}
+		}
+	}
+	async.AppendAsyncJob(_KVDB_ASYNC_JOB_GROUP, kvdbRoutine(func() (res interface{}, err error) {
+		res, err = kvdbEngine.Get(key)
+		return
+	}), ac)
+}
+
+func kvdbRoutine(r func() (res interface{}, err error)) func() (res interface{}, err error) {
+	kvdbroutine := func() (res interface{}, err error) {
+		for {
+			err := assureKVDBEngineReady()
+			if err == nil {
+				break
+			} else {
+				gwlog.Errorf("KVDB engine is not ready: %s", err)
+				time.Sleep(time.Second)
+			}
+		}
+
+		res, err = r()
+
+		if err != nil && kvdbEngine.IsConnectionError(err) {
+			kvdbEngine.Close()
+			kvdbEngine = nil
+		}
+		return
+	}
+
+	return kvdbroutine
 }
 
 // Put puts key-value item to KVDB, returns in callback
 func Put(key string, val string, callback KVDBPutCallback) {
-	kvdbOpQueue.Push(&putReq{
-		key, val, callback,
-	})
-	checkOperationQueueLen()
+	var ac async.AsyncCallback
+	if callback != nil {
+		ac = func(res interface{}, err error) {
+			callback(err)
+		}
+	}
+
+	async.AppendAsyncJob(_KVDB_ASYNC_JOB_GROUP, kvdbRoutine(func() (res interface{}, err error) {
+		err = kvdbEngine.Put(key, val)
+		return
+	}), ac)
+}
+
+// GetOrPut gets value of key from KVDB, if val not exists or is "", put key-value to KVDB.
+func GetOrPut(key string, val string, callback KVDBGetOrPutCallback) {
+	var ac async.AsyncCallback
+	if callback != nil {
+		ac = func(res interface{}, err error) {
+			if err == nil {
+				callback(res.(string), err)
+			} else {
+				callback("", err)
+			}
+		}
+	}
+
+	async.AppendAsyncJob(_KVDB_ASYNC_JOB_GROUP, kvdbRoutine(func() (res interface{}, err error) {
+		oldVal, err := kvdbEngine.Get(key)
+		if err == nil {
+			if oldVal == "" {
+				err = kvdbEngine.Put(key, val)
+			}
+		}
+
+		return oldVal, err
+	}), ac)
 }
 
 // GetRange retrives key-value items of specified key range, returns in callback
 func GetRange(beginKey string, endKey string, callback KVDBGetRangeCallback) {
-	kvdbOpQueue.Push(&getRangeReq{
-		beginKey, endKey, callback,
-	})
-	checkOperationQueueLen()
+	var ac async.AsyncCallback
+	if callback != nil {
+		ac = func(res interface{}, err error) {
+			if err == nil {
+				callback(res.([]kvdbtypes.KVItem), nil)
+			} else {
+				callback(nil, err)
+			}
+		}
+	}
+
+	async.AppendAsyncJob(_KVDB_ASYNC_JOB_GROUP, kvdbRoutine(func() (res interface{}, err error) {
+		it, err := kvdbEngine.Find(beginKey, endKey)
+		if err != nil {
+			return nil, err
+		}
+
+		var items []kvdbtypes.KVItem
+		for {
+			item, err := it.Next()
+			if err == io.EOF {
+				break
+			}
+
+			if err != nil {
+				return nil, err
+			}
+
+			items = append(items, item)
+		}
+		return items, nil
+	}), ac)
 }
 
 // NextLargerKey finds the next key that is larger than the specified key,
 // but smaller than any other keys that is larger than the specified key
 func NextLargerKey(key string) string {
 	return key + "\x00" // the next string that is larger than key, but smaller than any other keys > key
-}
-
-// Close the KVDB
-func Close() {
-	kvdbOpQueue.Close()
-}
-
-var recentWarnedQueueLen = 0
-
-func checkOperationQueueLen() {
-	qlen := kvdbOpQueue.Len()
-	if qlen > 100 && qlen%100 == 0 && recentWarnedQueueLen != qlen {
-		gwlog.Warn("KVDB operation queue length = %d", qlen)
-		recentWarnedQueueLen = qlen
-	}
-}
-
-func kvdbRoutine() {
-	for {
-		err := assureKVDBEngineReady()
-		if err != nil {
-			gwlog.Error("KVDB engine is not ready: %s", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		req := kvdbOpQueue.Pop()
-		if req == nil { // queue is closed, returning nil
-			kvdbEngine.Close()
-			break
-		}
-
-		var op *opmon.Operation
-		if getReq, ok := req.(*getReq); ok {
-			op = opmon.StartOperation("kvdb.get")
-			handleGetReq(getReq)
-		} else if putReq, ok := req.(*putReq); ok {
-			op = opmon.StartOperation("kvdb.put")
-			handlePutReq(putReq)
-		} else if getRangeReq, ok := req.(*getRangeReq); ok {
-			op = opmon.StartOperation("kvdb.getRange")
-			handleGetRangeReq(getRangeReq)
-		}
-		op.Finish(time.Millisecond * 100)
-	}
-
-	kvdbTerminated.Signal()
-}
-
-// WaitTerminated waits for KVDB to terminate
-func WaitTerminated() {
-	kvdbTerminated.Wait()
-}
-
-func handleGetReq(getReq *getReq) {
-	val, err := kvdbEngine.Get(getReq.key)
-	if getReq.callback != nil {
-		post.Post(func() {
-			getReq.callback(val, err)
-		})
-	}
-
-	if err != nil && kvdbEngine.IsEOF(err) {
-		kvdbEngine.Close()
-		kvdbEngine = nil
-	}
-}
-
-func handlePutReq(putReq *putReq) {
-	err := kvdbEngine.Put(putReq.key, putReq.val)
-	if putReq.callback != nil {
-		post.Post(func() {
-			putReq.callback(err)
-		})
-	}
-
-	if err != nil && kvdbEngine.IsEOF(err) {
-		kvdbEngine.Close()
-		kvdbEngine = nil
-	}
-}
-
-func handleGetRangeReq(getRangeReq *getRangeReq) {
-	it := kvdbEngine.Find(getRangeReq.beginKey, getRangeReq.endKey)
-	var items []KVItem
-	for {
-		item, err := it.Next()
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			if getRangeReq.callback != nil {
-				post.Post(func() {
-					getRangeReq.callback(nil, err)
-				})
-			}
-			return
-		}
-
-		items = append(items, item)
-	}
-
-	if getRangeReq.callback != nil {
-		post.Post(func() {
-			getRangeReq.callback(items, nil)
-		})
-	}
 }

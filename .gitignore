@@ -15,6 +15,7 @@
 
 *~
 *.log
+*.log.gz
 .*.swp
 .*.swo
 
@@ -31,3 +32,5 @@ engine/storage/backend/filesystem/test_entity_storage/
 *.dat
 vendor/
 .idea.bak/
+.vscode/
+tests/

@@ -28,12 +28,8 @@ type Space struct {
 
 	entities EntitySet
 	Kind     int
-	I        ISpace
-	aoiCalc  AOICalculator
-}
-
-func init() {
-
+	//I        ISpace
+	aoiCalc AOICalculator
 }
 
 func (space *Space) String() string {
@@ -43,19 +39,15 @@ func (space *Space) String() string {
 	return "Space<nil>"
 }
 
+func (space *Space) DefineAttrs(desc *EntityTypeDesc) {
+	desc.DefineAttr(_SPACE_KIND_ATTR_KEY, "AllClients")
+}
+
 // OnInit initialize Space entity
 func (space *Space) OnInit() {
 	space.entities = EntitySet{}
-	space.I = space.Entity.I.(ISpace)
+	space.I = space.Entity.I
 	space.aoiCalc = newXZListAOICalculator()
-	gwutils.RunPanicless(space.I.OnSpaceInit)
-}
-
-// OnSpaceInit is called when Space is initializing
-//
-// Custom space type can override to provide custom logic
-func (space *Space) OnSpaceInit() {
-
 }
 
 // OnCreated is called when Space entity is created
@@ -67,9 +59,9 @@ func (space *Space) OnCreated() {
 	}
 
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("%s.OnCreated", space)
+		gwlog.Debugf("%s.OnCreated", space)
 	}
-	gwutils.RunPanicless(space.I.OnSpaceCreated)
+	space.callCompositiveMethod("OnSpaceCreated")
 }
 
 // OnRestored is called when space entity is restored
@@ -78,7 +70,7 @@ func (space *Space) OnRestored() {
 }
 
 func (space *Space) onSpaceCreated() {
-	space.Kind = space.GetInt(_SPACE_KIND_ATTR_KEY)
+	space.Kind = int(space.GetInt(_SPACE_KIND_ATTR_KEY))
 	spaceManager.putSpace(space)
 
 	if space.Kind == 0 {
@@ -87,7 +79,7 @@ func (space *Space) onSpaceCreated() {
 		}
 		nilSpace = space
 		nilSpace.Space = nilSpace
-		gwlog.Info("Created nil space: %s", nilSpace)
+		gwlog.Infof("Created nil space: %s", nilSpace)
 		return
 	}
 }
@@ -97,13 +89,13 @@ func (space *Space) onSpaceCreated() {
 // Custom space type can override to provide custom logic
 func (space *Space) OnSpaceCreated() {
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("Space %s created", space)
+		gwlog.Debugf("Space %s created", space)
 	}
 }
 
 // OnDestroy is called when Space entity is destroyed
 func (space *Space) OnDestroy() {
-	gwutils.RunPanicless(space.I.OnSpaceDestroy)
+	space.callCompositiveMethod("OnSpaceDestroy")
 	// destroy all entities
 	for e := range space.entities {
 		e.Destroy()
@@ -117,7 +109,7 @@ func (space *Space) OnDestroy() {
 // Custom space type can override to provide custom logic
 func (space *Space) OnSpaceDestroy() {
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("Space %s created", space)
+		gwlog.Debugf("Space %s created", space)
 	}
 }
 
@@ -127,27 +119,27 @@ func (space *Space) IsNil() bool {
 }
 
 // CreateEntity creates a new local entity in this space
-func (space *Space) CreateEntity(typeName string, pos Position) {
+func (space *Space) CreateEntity(typeName string, pos Vector3) {
 	createEntity(typeName, space, pos, "", nil, nil, nil, ccCreate)
 }
 
 // LoadEntity loads a entity of specified entityID to the space
 //
 // If the entity already exists on server, this call has no effect
-func (space *Space) LoadEntity(typeName string, entityID common.EntityID, pos Position) {
+func (space *Space) LoadEntity(typeName string, entityID common.EntityID, pos Vector3) {
 	loadEntityLocally(typeName, entityID, space, pos)
 }
 
-func (space *Space) enter(entity *Entity, pos Position, isRestore bool) {
+func (space *Space) enter(entity *Entity, pos Vector3, isRestore bool) {
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("%s.enter <<< %s, avatar count=%d, monster count=%d", space, entity, space.CountEntities("Avatar"), space.CountEntities("Monster"))
+		gwlog.Debugf("%s.enter <<< %s, avatar count=%d, monster count=%d", space, entity, space.CountEntities("Avatar"), space.CountEntities("Monster"))
 	}
 
 	if entity.Space != nilSpace {
 		gwlog.Panicf("%s.enter(%s): current Space is not nil", space, entity)
 	}
 
-	if space.IsNil() { // enter nil space does nothing
+	if space.IsNil() || !entity.IsUseAOI() { // enter nil space does nothing
 		return
 	}
 
@@ -161,7 +153,7 @@ func (space *Space) enter(entity *Entity, pos Position, isRestore bool) {
 		entity.client.sendCreateEntity(&space.Entity, false) // create Space entity before every other entities
 
 		enter, _ := space.aoiCalc.Adjust(&entity.aoi)
-		// gwlog.Info("Entity %s entering at pos %v: %v: enter %d neighbors", entity, pos, entity.GetPosition(), len(enter))
+		// gwlog.Infof("Entity %s entering at pos %v: %v: enter %d neighbors", entity, pos, entity.GetPosition(), len(enter))
 
 		for _, naoi := range enter {
 			neighbor := naoi.getEntity()
@@ -170,8 +162,8 @@ func (space *Space) enter(entity *Entity, pos Position, isRestore bool) {
 		}
 
 		gwutils.RunPanicless(func() {
-			space.I.OnEntityEnterSpace(entity)
-			entity.I.OnEnterSpace()
+			space.callCompositiveMethod("OnEntityEnterSpace", entity)
+			entity.callCompositiveMethod("OnEnterSpace")
 		})
 	} else {
 		enter, _ := space.aoiCalc.Adjust(&entity.aoi)
@@ -204,14 +196,15 @@ func (space *Space) leave(entity *Entity) {
 	space.entities.Del(entity)
 	entity.Space = nilSpace
 
-	gwutils.RunPanicless(func() {
-		space.I.OnEntityLeaveSpace(entity)
-	})
-
-	entity.I.OnLeaveSpace(space)
+	space.callCompositiveMethod("OnEntityLeaveSpace", entity)
+	entity.callCompositiveMethod("OnLeaveSpace", space)
 }
 
-func (space *Space) move(entity *Entity, newPos Position) {
+func (space *Space) move(entity *Entity, newPos Vector3) {
+	if space.IsNil() {
+		return // never move in nil space
+	}
+
 	space.aoiCalc.Move(&entity.aoi, newPos)
 	enter, leave := space.aoiCalc.Adjust(&entity.aoi)
 
@@ -238,7 +231,7 @@ func (space *Space) move(entity *Entity, newPos Position) {
 //
 //	for e := range space.entities {
 //		if e.aoi.markVal != 0 {
-//			gwlog.Fatalf("%s: wrong AOI mark val = %d", e.aoi.markVal)
+//			gwlog.Fatalf("%s: wrong aoi mark val = %d", e.aoi.markVal)
 //		}
 //
 //		if e == entity {
@@ -259,7 +252,7 @@ func (space *Space) move(entity *Entity, newPos Position) {
 // Custom space type can override this function
 func (space *Space) OnEntityEnterSpace(entity *Entity) {
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("%s ENTER SPACE %s", entity, space)
+		gwlog.Debugf("%s ENTER SPACE %s", entity, space)
 	}
 }
 
@@ -268,7 +261,7 @@ func (space *Space) OnEntityEnterSpace(entity *Entity) {
 // Custom space type can override this function
 func (space *Space) OnEntityLeaveSpace(entity *Entity) {
 	if consts.DEBUG_SPACES {
-		gwlog.Debug("%s LEAVE SPACE %s", entity, space)
+		gwlog.Debugf("%s LEAVE SPACE %s", entity, space)
 	}
 }
 
@@ -288,7 +281,28 @@ func (space *Space) GetEntityCount() int {
 	return len(space.entities)
 }
 
-// AOI Management
+// ForEachEntity visits all entities in space and call function f with each entity
+func (space *Space) ForEachEntity(f func(e *Entity)) {
+	for e := range space.entities {
+		f(e)
+	}
+}
+
+// GetEntity returns the entity in space with specified ID, nil otherwise
+func (space *Space) GetEntity(entityID common.EntityID) *Entity {
+	entity := GetEntity(entityID)
+	if entity == nil {
+		return nil
+	}
+
+	if space.entities.Contains(entity) {
+		return entity
+	} else {
+		return nil
+	}
+}
+
+// aoi Management
 func (space *Space) addToAOI(entity *Entity) {
 
 }

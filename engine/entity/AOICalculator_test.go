@@ -27,7 +27,7 @@ func TestXAOIList_Remove(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		N1 := rand.Intn(100)
 		N2 := rand.Intn(100)
-		remove := []*AOI{}
+		remove := []*aoi{}
 		list := newXAOIList()
 		for j := 0; j < N1; j++ {
 			aoi := randAOI()
@@ -49,7 +49,7 @@ func TestXAOIList_Remove(t *testing.T) {
 
 func TestXAOIList_Move(t *testing.T) {
 	for i := 0; i < 1000; i++ {
-		aois := []*AOI{}
+		aois := []*aoi{}
 		list := newXAOIList()
 		N := 1 + rand.Intn(100)
 		for j := 0; j < N; j++ {
@@ -72,7 +72,7 @@ func TestXAOIList_Move(t *testing.T) {
 
 func TestXAOIList_Interested(t *testing.T) {
 	for i := 0; i < 1000; i++ {
-		aois := []*AOI{}
+		aois := []*aoi{}
 		list := newXAOIList()
 		N := 1 + rand.Intn(100)
 		for j := 0; j < N; j++ {
@@ -85,28 +85,31 @@ func TestXAOIList_Interested(t *testing.T) {
 
 		for r := 0; r < 10; r++ {
 			aoi := aois[rand.Intn(len(aois))]
-			interested := list.Interested(aoi)
-			for other := range interested {
-				if math.Abs(float64(aoi.pos.X-other.pos.X)) > _DEFAULT_AOI_DISTANCE {
-					t.Errorf("should not interest")
-				}
-			}
+			list.Mark(aoi)
+
 			for _, other := range aois {
-				if other == aoi || interested.Contains(other) {
+				if other == aoi {
 					continue
 				}
 
-				if math.Abs(float64(aoi.pos.X-other.pos.X)) <= _DEFAULT_AOI_DISTANCE {
-					t.Errorf("should not interest")
+				if other.markVal == 1 {
+					if math.Abs(float64(aoi.pos.X-other.pos.X)) > _DEFAULT_AOI_DISTANCE {
+						t.Fail()
+					}
+					other.markVal = 0
+				} else {
+					if math.Abs(float64(aoi.pos.X-other.pos.X)) <= _DEFAULT_AOI_DISTANCE {
+						t.Fail()
+					}
 				}
 			}
 		}
 	}
 }
 
-func randAOI() *AOI {
-	return &AOI{
-		pos: Position{
+func randAOI() *aoi {
+	return &aoi{
+		pos: Vector3{
 			X: Coord(rand.Intn(100)),
 			Y: Coord(rand.Intn(100)),
 			Z: Coord(rand.Intn(100)),
@@ -132,7 +135,7 @@ func checkList(t *testing.T, list *xAOIList, N int) {
 	}
 
 	p := list.head
-	var last *AOI
+	var last *aoi
 
 	for i := 0; i < N; i++ {
 		if p == nil {

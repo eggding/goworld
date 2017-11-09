@@ -9,12 +9,17 @@ import (
 
 	"os"
 
+	"github.com/bmizerany/assert"
 	"github.com/xiaonanln/goworld/engine/gwlog"
 )
 
+func init() {
+	SetConfigFile("../../goworld.ini.sample")
+}
+
 func TestLoad(t *testing.T) {
 	config := Get()
-	gwlog.Debug("goworld config: \n%s", config)
+	gwlog.Debugf("goworld config: \n%s", config)
 	if config == nil {
 		t.FailNow()
 	}
@@ -33,13 +38,13 @@ func TestLoad(t *testing.T) {
 		}
 	}
 
-	gwlog.Info("read goworld config: %v", config)
+	gwlog.Infof("read goworld config: %v", config)
 }
 
 func TestReload(t *testing.T) {
-	config := Get()
-	config = Reload()
-	gwlog.Debug("goworld config: \n%s", config)
+	Get()
+	config := Reload()
+	gwlog.Debugf("goworld config: \n%s", config)
 }
 
 func TestGetDispatcher(t *testing.T) {
@@ -52,9 +57,9 @@ func TestGetGame(t *testing.T) {
 	for id := 1; id <= 10; id++ {
 		cfg := GetGame(uint16(id))
 		if cfg == nil {
-			gwlog.Info("Game %d not found", id)
+			gwlog.Infof("Game %d not found", id)
 		} else {
-			gwlog.Info("Game %d config: %v", id, cfg)
+			gwlog.Infof("Game %d config: %v", id, cfg)
 		}
 	}
 }
@@ -64,6 +69,28 @@ func TestGetStorage(t *testing.T) {
 	if cfg == nil {
 		t.Errorf("storage config not found")
 	}
-	gwlog.Info("storage config:")
+	gwlog.Infof("storage config:")
 	fmt.Fprintf(os.Stderr, "%s\n", DumpPretty(cfg))
+}
+
+func TestGetKVDB(t *testing.T) {
+	assert.T(t, GetKVDB() != nil, "kvdb config is nil")
+}
+
+func TestGetGameIDs(t *testing.T) {
+	GetGameIDs()
+}
+
+func TestGetGate(t *testing.T) {
+	GetGate(1)
+}
+
+func TestGetGateIDs(t *testing.T) {
+	GetGateIDs()
+	//assert.Equal(t, len(gids), 1, "gate num is wrong")
+	//assert.Equal(t, gids[0], uint16(1), "gate id is not 1")
+}
+
+func TestSetConfigFile(t *testing.T) {
+	SetConfigFile("goworld.ini")
 }

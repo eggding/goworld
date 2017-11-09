@@ -12,15 +12,22 @@ import (
 
 	"os"
 
+	"crypto/tls"
+
+	"path"
+
+	"github.com/pkg/errors"
 	"github.com/xiaonanln/go-xnsyncutil/xnsyncutil"
 	"github.com/xiaonanln/goworld/components/dispatcher/dispatcherclient"
 	"github.com/xiaonanln/goworld/engine/common"
 	"github.com/xiaonanln/goworld/engine/config"
 	"github.com/xiaonanln/goworld/engine/consts"
 	"github.com/xiaonanln/goworld/engine/gwlog"
+	"github.com/xiaonanln/goworld/engine/gwutils"
 	"github.com/xiaonanln/goworld/engine/netutil"
 	"github.com/xiaonanln/goworld/engine/opmon"
 	"github.com/xiaonanln/goworld/engine/proto"
+	"github.com/xtaci/kcp-go"
 )
 
 // GateService implements the gate service logic
@@ -38,6 +45,7 @@ type GateService struct {
 
 	terminating xnsyncutil.AtomicBool
 	terminated  *xnsyncutil.OneTimeCond
+	tlsConfig   *tls.Config
 }
 
 func newGateService() *GateService {
@@ -53,10 +61,43 @@ func newGateService() *GateService {
 
 func (gs *GateService) run() {
 	cfg := config.GetGate(gateid)
-	gwlog.Info("Compress connection: %v", cfg.CompressConnection)
+	gwlog.Infof("Compress connection: %v, encrypt connection: %v", cfg.CompressConnection, cfg.EncryptConnection)
+
+	if cfg.EncryptConnection {
+		gs.setupTLSConfig(cfg)
+	}
+
 	gs.listenAddr = fmt.Sprintf("%s:%d", cfg.Ip, cfg.Port)
 	go netutil.ServeTCPForever(gs.listenAddr, gs)
-	netutil.ServeForever(gs.handlePacketRoutine)
+	go gs.serveKCP(gs.listenAddr)
+	if cfg.HeartbeatCheckInterval > 0 {
+		go gs.checkClientHeartbeatsRoutine(cfg.HeartbeatCheckInterval)
+	}
+	fmt.Fprintf(gwlog.GetOutput(), "%s\n", consts.GATE_STARTED_TAG)
+	gwutils.RepeatUntilPanicless(gs.handlePacketRoutine)
+}
+
+func (gs *GateService) setupTLSConfig(cfg *config.GateConfig) {
+	cfgdir := config.GetConfigDir()
+	rsaCert := path.Join(cfgdir, cfg.RSACertificate)
+	rsaKey := path.Join(cfgdir, cfg.RSAKey)
+	cert, err := tls.LoadX509KeyPair(rsaCert, rsaKey)
+	if err != nil {
+		gwlog.Panic(errors.Wrap(err, "load RSA key & certificate failed"))
+	}
+
+	gs.tlsConfig = &tls.Config{
+		//MinVersion:       tls.VersionTLS12,
+		//CurvePreferences: []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+		Certificates: []tls.Certificate{cert},
+		//CipherSuites: []uint16{
+		//	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		//	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		//	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		//	tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		//},
+		//PreferServerCipherSuites: true,
+	}
 }
 
 func (gs *GateService) String() string {
@@ -68,18 +109,52 @@ func (gs *GateService) ServeTCPConnection(conn net.Conn) {
 	tcpConn := conn.(*net.TCPConn)
 	tcpConn.SetWriteBuffer(consts.CLIENT_PROXY_WRITE_BUFFER_SIZE)
 	tcpConn.SetReadBuffer(consts.CLIENT_PROXY_READ_BUFFER_SIZE)
+	tcpConn.SetNoDelay(consts.CLIENT_PROXY_SET_TCP_NO_DELAY)
 
-	gs.handleClientConnection(conn)
+	gs.handleClientConnection(conn, false)
+}
+
+func (gs *GateService) serveKCP(addr string) {
+	kcpListener, err := kcp.ListenWithOptions(addr, nil, 10, 3)
+	if err != nil {
+		gwlog.Panic(err)
+	}
+
+	gwlog.Infof("Listening on KCP: %s ...", addr)
+
+	gwutils.RepeatUntilPanicless(func() {
+		for {
+			conn, err := kcpListener.AcceptKCP()
+			if err != nil {
+				gwlog.Panic(err)
+			}
+			go gs.handleKCPConn(conn)
+		}
+	})
+}
+
+func (gs *GateService) handleKCPConn(conn *kcp.UDPSession) {
+	gwlog.Infof("KCP connection from %s", conn.RemoteAddr())
+
+	conn.SetReadBuffer(consts.CLIENT_PROXY_READ_BUFFER_SIZE)
+	conn.SetWriteBuffer(consts.CLIENT_PROXY_WRITE_BUFFER_SIZE)
+	// turn on turbo mode according to https://github.com/skywind3000/kcp/blob/master/README.en.md#protocol-configuration
+	conn.SetNoDelay(consts.KCP_NO_DELAY, consts.KCP_INTERNAL_UPDATE_TIMER_INTERVAL, consts.KCP_ENABLE_FAST_RESEND, consts.KCP_DISABLE_CONGESTION_CONTROL)
+	conn.SetStreamMode(consts.KCP_SET_STREAM_MODE)
+	conn.SetWriteDelay(consts.KCP_SET_WRITE_DELAY)
+	conn.SetACKNoDelay(consts.KCP_SET_ACK_NO_DELAY)
+
+	gs.handleClientConnection(conn, false)
 }
 
 func (gs *GateService) handleWebSocketConn(wsConn *websocket.Conn) {
-	gwlog.Debug("WebSocket Connection: %s", wsConn.RemoteAddr())
+	gwlog.Debugf("WebSocket Connection: %s", wsConn.RemoteAddr())
 	//var conn netutil.Connection = NewWebSocketConn(wsConn)
 	wsConn.PayloadType = websocket.BinaryFrame
-	gs.handleClientConnection(wsConn)
+	gs.handleClientConnection(wsConn, true)
 }
 
-func (gs *GateService) handleClientConnection(netconn net.Conn) {
+func (gs *GateService) handleClientConnection(netconn net.Conn, isWebSocket bool) {
 	if gs.terminating.Load() {
 		// server terminating, not accepting more connectionsF
 		netconn.Close()
@@ -87,6 +162,12 @@ func (gs *GateService) handleClientConnection(netconn net.Conn) {
 	}
 
 	cfg := config.GetGate(gateid)
+
+	if cfg.EncryptConnection && !isWebSocket {
+		tlsConn := tls.Server(netconn, gs.tlsConfig)
+		netconn = net.Conn(tlsConn)
+	}
+
 	conn := netutil.NetConnection{netconn}
 	cp := newClientProxy(conn, cfg)
 
@@ -96,9 +177,32 @@ func (gs *GateService) handleClientConnection(netconn net.Conn) {
 
 	dispatcherclient.GetDispatcherClientForSend().SendNotifyClientConnected(cp.clientid)
 	if consts.DEBUG_CLIENTS {
-		gwlog.Debug("%s.ServeTCPConnection: client %s connected", gs, cp)
+		gwlog.Debugf("%s.ServeTCPConnection: client %s connected", gs, cp)
 	}
 	cp.serve()
+}
+
+func (gs *GateService) checkClientHeartbeatsRoutine(checkInterval int) {
+	gwutils.RepeatUntilPanicless(func() {
+		checkIntervalDuration := time.Duration(checkInterval) * time.Second
+		for {
+			time.Sleep(checkIntervalDuration)
+
+			now := time.Now().Unix()
+			gs.clientProxiesLock.RLock()
+
+			for _, cp := range gs.clientProxies { // close all connected clients when terminating
+				heatbeatTime := cp.heartbeatTime.Load()
+				if heatbeatTime < now-int64(checkInterval) {
+					// 10 seconds no heartbeat, close it...
+					gwlog.Infof("Connection %s timeout ...", cp)
+					cp.Close()
+				}
+			}
+
+			gs.clientProxiesLock.RUnlock()
+		}
+	})
 }
 
 func (gs *GateService) onClientProxyClose(cp *ClientProxy) {
@@ -111,7 +215,7 @@ func (gs *GateService) onClientProxyClose(cp *ClientProxy) {
 		ft := gs.filterTrees[key]
 		if ft != nil {
 			if consts.DEBUG_FILTER_PROP {
-				gwlog.Debug("DROP CLIENT %s FILTER PROP: %s = %s", cp, key, val)
+				gwlog.Debugf("DROP CLIENT %s FILTER PROP: %s = %s", cp, key, val)
 			}
 			ft.Remove(cp.clientid, val)
 		}
@@ -120,14 +224,14 @@ func (gs *GateService) onClientProxyClose(cp *ClientProxy) {
 
 	dispatcherclient.GetDispatcherClientForSend().SendNotifyClientDisconnected(cp.clientid)
 	if consts.DEBUG_CLIENTS {
-		gwlog.Debug("%s.onClientProxyClose: client %s disconnected", gs, cp)
+		gwlog.Debugf("%s.onClientProxyClose: client %s disconnected", gs, cp)
 	}
 }
 
 // HandleDispatcherClientPacket handles packets received by dispatcher client
 func (gs *GateService) HandleDispatcherClientPacket(msgtype proto.MsgType, packet *netutil.Packet) {
 	if consts.DEBUG_PACKETS {
-		gwlog.Debug("%s.HandleDispatcherClientPacket: msgtype=%v, packet(%d)=%v", gs, msgtype, packet.GetPayloadLen(), packet.Payload())
+		gwlog.Debugf("%s.HandleDispatcherClientPacket: msgtype=%v, packet(%d)=%v", gs, msgtype, packet.GetPayloadLen(), packet.Payload())
 	}
 
 	if msgtype >= proto.MT_REDIRECT_TO_GATEPROXY_MSG_TYPE_START && msgtype <= proto.MT_REDIRECT_TO_GATEPROXY_MSG_TYPE_STOP {
@@ -164,7 +268,7 @@ func (gs *GateService) HandleDispatcherClientPacket(msgtype proto.MsgType, packe
 }
 
 func (gs *GateService) handleSetClientFilterProp(clientproxy *ClientProxy, packet *netutil.Packet) {
-	gwlog.Debug("%s.handleSetClientFilterProp: clientproxy=%s", gs, clientproxy)
+	gwlog.Debugf("%s.handleSetClientFilterProp: clientproxy=%s", gs, clientproxy)
 	key := packet.ReadVarStr()
 	val := packet.ReadVarStr()
 	clientid := clientproxy.clientid
@@ -179,7 +283,7 @@ func (gs *GateService) handleSetClientFilterProp(clientproxy *ClientProxy, packe
 	oldVal, ok := clientproxy.filterProps[key]
 	if ok {
 		if consts.DEBUG_FILTER_PROP {
-			gwlog.Debug("REMOVE CLIENT %s FILTER PROP: %s = %s", clientproxy, key, val)
+			gwlog.Debugf("REMOVE CLIENT %s FILTER PROP: %s = %s", clientproxy, key, val)
 		}
 		ft.Remove(clientid, oldVal)
 	}
@@ -188,12 +292,12 @@ func (gs *GateService) handleSetClientFilterProp(clientproxy *ClientProxy, packe
 	gs.filterTreesLock.Unlock()
 
 	if consts.DEBUG_FILTER_PROP {
-		gwlog.Debug("SET CLIENT %s FILTER PROP: %s = %s", clientproxy, key, val)
+		gwlog.Debugf("SET CLIENT %s FILTER PROP: %s = %s", clientproxy, key, val)
 	}
 }
 
 func (gs *GateService) handleClearClientFilterProps(clientproxy *ClientProxy, packet *netutil.Packet) {
-	gwlog.Debug("%s.handleClearClientFilterProps: clientproxy=%s", gs, clientproxy)
+	gwlog.Debugf("%s.handleClearClientFilterProps: clientproxy=%s", gs, clientproxy)
 	clientid := clientproxy.clientid
 
 	gs.filterTreesLock.Lock()
@@ -208,7 +312,7 @@ func (gs *GateService) handleClearClientFilterProps(clientproxy *ClientProxy, pa
 	gs.filterTreesLock.Unlock()
 
 	if consts.DEBUG_FILTER_PROP {
-		gwlog.Debug("CLEAR CLIENT %s FILTER PROPS", clientproxy)
+		gwlog.Debugf("CLEAR CLIENT %s FILTER PROPS", clientproxy)
 	}
 }
 
@@ -222,6 +326,7 @@ func (gs *GateService) handleSyncPositionYawOnClients(packet *netutil.Packet) {
 		data := payload[i+common.CLIENTID_LENGTH : i+common.CLIENTID_LENGTH+common.ENTITYID_LENGTH+proto.SYNC_INFO_SIZE_PER_ENTITY]
 		dispatch[clientid] = append(dispatch[clientid], data...)
 	}
+	//fmt.Fprintf(os.Stderr, "(%d,%d)", payloadLen, len(dispatch))
 
 	// multiple entity sync infos are received from game->dispatcher, gate need to dispatcher these infos to different clients
 	gs.clientProxiesLock.RLock()
@@ -291,9 +396,9 @@ func (gs *GateService) handleDispatcherClientBeforeFlush() {
 		gwlog.Panicf("%s.handleDispatcherClientBeforeFlush: entity sync info size should be %d, but received %d", gs, proto.SYNC_INFO_SIZE_PER_ENTITY, len(packet.UnreadPayload())-common.ENTITYID_LENGTH)
 	}
 
-	//gwlog.Info("sycn packet payload len %d, unread %d", packet.GetPayloadLen(), len(packet.UnreadPayload()))
+	//gwlog.Infof("sycn packet payload len %d, unread %d", packet.GetPayloadLen(), len(packet.UnreadPayload()))
 	for _, syncPkt := range pendingSyncPackets[1:] { // merge other packets to the first packet
-		//gwlog.Info("sycn packet unread %d", len(syncPkt.UnreadPayload()))
+		//gwlog.Infof("sycn packet unread %d", len(syncPkt.UnreadPayload()))
 		packet.AppendBytes(syncPkt.UnreadPayload())
 		syncPkt.Release()
 	}

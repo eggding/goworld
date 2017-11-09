@@ -17,12 +17,7 @@ type Account struct {
 	logining      bool
 }
 
-func (a *Account) OnInit() {
-
-}
-
-func (a *Account) OnCreated() {
-	//gwlog.Info("%s created: client=%v", a, a.GetClient())
+func (a *Account) DefineAttrs(desc *entity.EntityTypeDesc) {
 }
 
 func (a *Account) getAvatarID(username string, callback func(entityID common.EntityID, err error)) {
@@ -38,14 +33,15 @@ func (a Account) setAvatarID(username string, avatarID common.EntityID) {
 	goworld.PutKVDB(username, string(avatarID), nil)
 }
 
+// Login_Client is the login RPC for clients
 func (a *Account) Login_Client(username string, password string) {
 	if a.logining {
 		// logining
-		gwlog.Error("%s is already logining", a)
+		gwlog.Errorf("%s is already logining", a)
 		return
 	}
 
-	gwlog.Info("%s logining with username %s password %s ...", a, username, password)
+	gwlog.Infof("%s logining with username %s password %s ...", a, username, password)
 	if password != "123456" {
 		a.CallClient("OnLogin", false)
 		return
@@ -58,7 +54,7 @@ func (a *Account) Login_Client(username string, password string) {
 			gwlog.Panic(err)
 		}
 
-		gwlog.Debug("Username %s get avatar id = %s", username, avatarID)
+		gwlog.Debugf("Username %s get avatar id = %s", username, avatarID)
 		if avatarID.IsNil() {
 			// avatar not found, create new avatar
 			avatarID = goworld.CreateEntityLocally("Avatar")
@@ -73,6 +69,7 @@ func (a *Account) Login_Client(username string, password string) {
 	})
 }
 
+// OnGetAvatarSpaceID is called by Avatar to send spaceID
 func (a *Account) OnGetAvatarSpaceID(avatarID common.EntityID, spaceID common.EntityID) {
 	// avatar may be in the same space with account, check again
 	avatar := goworld.GetEntity(avatarID)
@@ -81,22 +78,24 @@ func (a *Account) OnGetAvatarSpaceID(avatarID common.EntityID, spaceID common.En
 		return
 	}
 
-	a.Attrs.Set("loginAvatarID", avatarID)
-	a.EnterSpace(spaceID, entity.Position{})
+	a.Attrs.SetStr("loginAvatarID", string(avatarID))
+	a.EnterSpace(spaceID, entity.Vector3{})
 }
 
 func (a *Account) onAvatarEntityFound(avatar *entity.Entity) {
 	a.GiveClientTo(avatar)
 }
 
+// OnClientDisconnected is triggered when client is disconnected or given
 func (a *Account) OnClientDisconnected() {
 	a.Destroy()
 }
 
+// OnMigrateIn is called when Account entity is migrate in
 func (a *Account) OnMigrateIn() {
 	loginAvatarID := common.EntityID(a.Attrs.GetStr("loginAvatarID"))
 	avatar := goworld.GetEntity(loginAvatarID)
-	gwlog.Debug("%s migrating in, attrs=%v, loginAvatarID=%s, avatar=%v, client=%s", a, a.Attrs.ToMap(), loginAvatarID, avatar, a.GetClient())
+	gwlog.Debugf("%s migrating in, attrs=%v, loginAvatarID=%s, avatar=%v, client=%s", a, a.Attrs.ToMap(), loginAvatarID, avatar, a.GetClient())
 
 	if avatar != nil {
 		a.onAvatarEntityFound(avatar)
@@ -106,11 +105,8 @@ func (a *Account) OnMigrateIn() {
 	}
 }
 
+// RetryLoginToAvatar retry to login
 func (a *Account) RetryLoginToAvatar(loginAvatarID common.EntityID) {
 	goworld.LoadEntityAnywhere("Avatar", loginAvatarID)
 	a.Call(loginAvatarID, "GetSpaceID", a.ID) // request for avatar space ID
-}
-
-func (a *Account) OnMigrateOut() {
-	gwlog.Debug("%s migrating out ...", a)
 }

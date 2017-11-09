@@ -3,8 +3,11 @@ type=mongodb
 url=mongodb://localhost:27017/
 db=goworld
 ;type=redis
-;host=127.0.0.1:6379
+;url=redis://127.0.0.1:6379/0/
 ;db=0
+;type=sql
+;driver=mysql
+;url=root:testmysql@tcp(127.0.0.1:3306)/goworld
 
 [kvdb]
 type=mongodb
@@ -12,10 +15,16 @@ url=mongodb://127.0.0.1:27017/goworld
 db=goworld
 collection=__kv__
 ;type=redis
-;host=127.0.0.1:6379
+;url=redis://127.0.0.1:6379/1/
 ;db=1
+;type=sql
+;driver=mysql
+;url=root:testmysql@tcp(127.0.0.1:3306)/goworld
+
 
 [dispatcher]
+bind_ip=127.0.0.1
+bind_port=13000
 ip=127.0.0.1
 port=13000
 log_file=dispatcher.log
@@ -24,7 +33,7 @@ http_ip=0.0.0.0
 http_port=13001
 log_level=debug
 
-[server_common]
+[game_common]
 boot_entity=Account
 save_interval=600
 log_file=game.log
@@ -33,24 +42,30 @@ http_ip=0.0.0.0
 log_level=debug
 ; gomaxprocs=0
 
-[server1]
+[game1]
 http_port=14001
 
-;[server2]
-;http_port=14002
+[game2]
+http_port=14002
 
 [gate_common]
+; gomaxprocs=0
 log_file=gate.log
 log_stderr=true
 http_ip=0.0.0.0
 log_level=debug
 compress_connection=0
-; gomaxprocs=0
+; supported compress formats: gwsnappy|snappy|flate|lz4|lzw
+compress_format=snappy
+encrypt_connection=0
+rsa_key=rsa.key
+rsa_certificate=rsa.crt
+heartbeat_check_interval = 0
 
 [gate1]
 port=15011
 http_port=15012
 
-;[gate2]
-;port=15021
-;http_port=15022
+[gate2]
+port=15021
+http_port=15022
